@@ -23,8 +23,6 @@ limitations under the License. */
 #endif
 #include "paddle/fluid/platform/gpu_launch_config.h"
 
-#define __MY_DEBUG__
-
 namespace paddle {
 namespace platform {
 struct CUDAPlace;
