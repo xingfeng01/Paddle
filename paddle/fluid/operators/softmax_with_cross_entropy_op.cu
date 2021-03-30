@@ -773,103 +773,20 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
 
     const bool softmax_switch = context.Attr<bool>("softmax_switch");
 
-      auto soft_label = context.Attr<bool>("soft_label");
-      auto ignore_index = context.Attr<int>("ignore_index");
+    auto soft_label = context.Attr<bool>("soft_label");
+    auto ignore_index = context.Attr<int>("ignore_index");
 
-      const Tensor* logits = context.Input<Tensor>("Logits");
-      const Tensor* labels = context.Input<Tensor>("Label");
-      Tensor* softmax = context.Output<Tensor>("Softmax");
-      Tensor* loss = context.Output<Tensor>("Loss");
+    const Tensor* logits = context.Input<Tensor>("Logits");
+    const Tensor* labels = context.Input<Tensor>("Label");
+    Tensor* softmax = context.Output<Tensor>("Softmax");
+    Tensor* loss = context.Output<Tensor>("Loss");
 
-      const int rank = logits->dims().size();
-      const int axis = CanonicalAxis(context.Attr<int>("axis"), rank);
-      int dim = logits->dims()[axis];
+    const int rank = logits->dims().size();
+    const int axis = CanonicalAxis(context.Attr<int>("axis"), rank);
+    int dim = logits->dims()[axis];
 
     const int64_t n = SizeToAxis(axis, logits->dims());
-    const int64_t d = SizeFromAxis(axis, logits->dims());
-
-    // do not with softmax op, and input is softmax
-    if (!softmax_switch) {
-
-
-
-      // const int n = SizeToAxis(axis, logits->dims());
-      // const int d = SizeFromAxis(axis, logits->dims());
-
-      auto* softmax_data = softmax->mutable_data<T>(context.GetPlace());
-      auto* loss_data = loss->mutable_data<T>(context.GetPlace());
-
-      math::SetConstant<platform::CUDADeviceContext, T> set_constant;
-      set_constant(context.cuda_device_context(), loss, static_cast<T>(0));
-      if (dim == 1) {
-        set_constant(context.cuda_device_context(), softmax,
-                     static_cast<T>(1));
-        return;
-      }
-
-      Tensor logits_2d, labels_2d, loss_2d, softmax_2d;
-      logits_2d.ShareDataWith(*logits).Resize({n, d});
-      labels_2d.ShareDataWith(*labels).Resize({n, labels->numel() / n});
-      loss_2d.ShareDataWith(*loss).Resize({n, 1});
-      softmax_2d.ShareDataWith(*softmax).Resize({n, d});
-
-      // // math::CrossEntropyFunctor support axis is the last
-      // if (axis == -1) {
-      //   math::CrossEntropyFunctor<platform::CUDADeviceContext, T>()(
-      //       context.cuda_device_context(), &loss_2d, &softmax_2d, &labels_2d,
-      //       soft_label, ignore_index, axis_dim);
-      //   return;
-      // }
-
-      // if axis is not the last, we need a new impliment
-      if (soft_label) {
-        auto* logits_data = logits->data<T>();
-        auto* labels_data = labels->data<T>();
-        // CrossEntropyFusedKernel(logits_data, labels_data, loss_data, n, d,
-        //                         axis_dim,
-        //                         context.cuda_device_context().stream());
-
-        int warp_size = 32;  // (dim < 32) ? dim : 32;
-        int batches_per_warp = 1;
-        constexpr int warps_per_block = 4;
-        constexpr int threads_per_block = 128;
-        int batches_per_block = warps_per_block * batches_per_warp;
-        int blocks = (n * d + batches_per_block - 1) / batches_per_block;
-        dim3 threads(warp_size, warps_per_block, 1);
-
-        CrossEntropySoftLabel<T><<<blocks, threads>>>(loss_data, logits_data,
-                                labels_data, n, dim, d/dim);   
-
-      } else {  // HardLabel
-        auto* logits_data = logits->data<T>();
-        auto* labels_data = labels->data<int64_t>();
-        // HardLabelCrossEntropy<T>(context.cuda_device_context(), logits_data,
-        //                          labels_data, loss_data, n, d, axis_dim,
-        //                          ignore_index);
-     
-        int threads = 128;
-        int blocks = (n * d + threads - 1) / threads;
-        CrossEntropyHardLabel<T><<<blocks, threads>>>(
-            loss_data, logits_data, labels_data, n, dim, d/dim, ignore_index);                         
-      }
-
-      // cause of input is softmax
-      // copy to output softmax, directly
-      framework::TensorCopy(*logits, context.GetPlace(),
-                            context.device_context(), softmax);
-    } else {
-
-    // const Tensor* logits = context.Input<Tensor>("Logits");
-    // const Tensor* labels = context.Input<Tensor>("Label");
-    // Tensor* softmax = context.Output<Tensor>("Softmax");
-    // Tensor* loss = context.Output<Tensor>("Loss");
-
-    // const int rank = logits->dims().size();
-    // const int axis = CanonicalAxis(context.Attr<int>("axis"), rank);
-    // int dim = logits->dims()[axis];
-
-    // const int64_t n = SizeToAxis(axis, logits->dims());
-    // const int64_t d = SizeFromAxis(axis, logits->dims());
+    const int64_t d = SizeOutAxis(axis, logits->dims());
 
     auto* softmax_data = softmax->mutable_data<T>(context.GetPlace());
     auto* loss_data = loss->mutable_data<T>(context.GetPlace());
@@ -881,39 +798,70 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
       return;
     }
 
-    if (soft_label) {
-      auto* logits_data = logits->data<T>();
-      auto* labels_data = labels->data<T>();
-      // SoftmaxWithCrossEntropyFusedKernel(
-      //     logits_data, labels_data, softmax_data, loss_data, n, d, axis_dim,
-      //     context.cuda_device_context().stream());
-      SoftmaxWithCrossEntropySoftLabel<T>(context, rank, axis, logits_data,
-          labels_data, softmax_data,
-          loss_data, n, dim, d/dim);
-    } else {
-      if (!context.Attr<bool>("numeric_stable_mode")) {
-        // CUDNN kernel only suppoer 2-D tensor and perfome softmax on last dim
-        Tensor logits_2d, softmax_2d, labels_2d, loss_2d;
-        logits_2d.ShareDataWith(*logits).Resize({n, d});
-        softmax_2d.ShareDataWith(*softmax).Resize({n, d});
-        labels_2d.ShareDataWith(*labels).Resize({n, labels->numel() / n});
-        loss_2d.ShareDataWith(*loss).Resize({n, 1});
-        math::SoftmaxCUDNNFunctor<T>()(context.cuda_device_context(),
-                                       &logits_2d, &softmax_2d);
-        math::CrossEntropyFunctor<platform::CUDADeviceContext, T>()(
-            context.cuda_device_context(), &loss_2d, &softmax_2d, &labels_2d,
-            false, ignore_index, dim);
-      } else {
+    if (!softmax_switch) {  // input is softmax
+      Tensor logits_2d, labels_2d, loss_2d, softmax_2d;
+      logits_2d.ShareDataWith(*logits).Resize({n, d * dim});
+      labels_2d.ShareDataWith(*labels).Resize({n, labels->numel() / n});
+      loss_2d.ShareDataWith(*loss).Resize({n, 1});
+      softmax_2d.ShareDataWith(*softmax).Resize({n, d * dim});
+
+      if (soft_label) {  // SoftLabel
+        auto* logits_data = logits->data<T>();
+        auto* labels_data = labels->data<T>();
+
+        int warp_size = 32;  // (dim < 32) ? dim : 32;
+        int batches_per_warp = 1;
+        constexpr int warps_per_block = 4;
+        constexpr int threads_per_block = 128;
+        int batches_per_block = warps_per_block * batches_per_warp;
+        int blocks = (n * d + batches_per_block - 1) / batches_per_block;
+        dim3 threads(warp_size, warps_per_block, 1);
+
+        CrossEntropySoftLabel<T><<<blocks, threads>>>(loss_data, logits_data,
+                                                      labels_data, n, dim, d);
+
+      } else {  // HardLabel
         auto* logits_data = logits->data<T>();
         auto* labels_data = labels->data<int64_t>();
-        // HardLabelSoftmaxWithCrossEntropy<T>(
-        //     context.cuda_device_context(), logits_data, labels_data, loss_data,
-        //     softmax_data, n, d, axis_dim, ignore_index);
-        SoftmaxWithCrossEntropyHardLabel<T>(
-            context, rank, axis, logits_data, labels_data, loss_data,
-            softmax_data, n, dim, d/dim, ignore_index);
+
+        int threads = 128;
+        int blocks = (n * d + threads - 1) / threads;
+        CrossEntropyHardLabel<T><<<blocks, threads>>>(
+            loss_data, logits_data, labels_data, n, dim, d, ignore_index);
       }
-    }
+
+      // input is softmax
+      framework::TensorCopy(*logits, context.GetPlace(),
+                            context.device_context(), softmax);
+    } else {
+      if (soft_label) {
+        auto* logits_data = logits->data<T>();
+        auto* labels_data = labels->data<T>();
+        SoftmaxWithCrossEntropySoftLabel<T>(context, rank, axis, logits_data,
+                                            labels_data, softmax_data,
+                                            loss_data, n, dim, d);
+      } else {
+        if (!context.Attr<bool>("numeric_stable_mode")) {
+          // CUDNN kernel only suppoer 2-D tensor and perfome softmax on last
+          // dim
+          Tensor logits_2d, softmax_2d, labels_2d, loss_2d;
+          logits_2d.ShareDataWith(*logits).Resize({n, d * dim});
+          softmax_2d.ShareDataWith(*softmax).Resize({n, d * dim});
+          labels_2d.ShareDataWith(*labels).Resize({n, labels->numel() / n});
+          loss_2d.ShareDataWith(*loss).Resize({n, 1});
+          math::SoftmaxCUDNNFunctor<T>()(context.cuda_device_context(),
+                                         &logits_2d, &softmax_2d);
+          math::CrossEntropyFunctor<platform::CUDADeviceContext, T>()(
+              context.cuda_device_context(), &loss_2d, &softmax_2d, &labels_2d,
+              false, ignore_index, dim);
+        } else {
+          auto* logits_data = logits->data<T>();
+          auto* labels_data = labels->data<int64_t>();
+          SoftmaxWithCrossEntropyHardLabel<T>(
+              context, rank, axis, logits_data, labels_data, loss_data,
+              softmax_data, n, dim, d, ignore_index);
+        }
+      }
     }
   }
 };
