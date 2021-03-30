@@ -112,6 +112,37 @@ __global__ void SoftCrossEntropyGradientKernel(T* logit_grad,
   }
 };
 
+}  // namespace
+
+template <typename T>
+__device__ __forceinline__ T logT(T x) {
+  return std::log(x);
+};
+
+template <>
+__device__ __forceinline__ paddle::platform::float16 logT(
+    paddle::platform::float16 x) {
+  return (paddle::platform::float16)std::log((float)x);
+};
+
+template <typename T>
+__global__ void CrossEntropyHardLabel(T* loss, const T* softmax,
+                                      const int64_t* labels, const int n,
+                                      const int dim, const int d,
+                                      const int ignore_idx) {
+  int64_t ids = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t idx_n = ids / d;
+  int64_t idx_d = ids % d;
+  if (ids < n * d) {
+    int64_t idx = idx_n * dim * d + labels[ids] * d + idx_d;
+    if (labels[ids] == ignore_idx) {
+      loss[ids] = (T)0.0;
+    } else {
+      loss[ids] = -logT(softmax[idx]);
+    };
+  };
+};
+
 template <typename T>
 __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
                                       const T* labels, const int n,
@@ -135,7 +166,7 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
       int idx_dim = it * warp_size + threadIdx.x;
       int idx = idx_n * dim * d + idx_d + idx_dim * d;
       if (idx_dim < dim) {
-        sum[i] -= (T)std::log((float)softmax[idx]) * labels[idx];
+        sum[i] -= logT(softmax[idx]) * labels[idx];
       }
     };
   };
@@ -150,44 +181,6 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
       }
     }
   }
-};
-
-}  // namespace
-
-template <typename T>
-__global__ void CrossEntropyHardLabel(T* loss, const T* softmax,
-                                      const int64_t* labels, const int n,
-                                      const int dim, const int d,
-                                      const int ignore_idx) {
-  int64_t ids = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t idx_n = ids / d;
-  int64_t idx_d = ids % d;
-  if (ids < n * d) {
-    int64_t idx = idx_n * dim * d + labels[ids] * d + idx_d;
-    if (labels[ids] == ignore_idx) {
-      loss[ids] = 0.0;
-    } else {
-      loss[ids] = -std::log(softmax[idx]);
-    }
-  };
-};
-
-template <>
-__global__ void CrossEntropyHardLabel<paddle::platform::float16>(
-    paddle::platform::float16* loss, const paddle::platform::float16* softmax,
-    const int64_t* labels, const int n, const int dim, const int d,
-    const int ignore_idx) {
-  int64_t ids = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t idx_n = ids / d;
-  int64_t idx_d = ids % d;
-  if (ids < n * d) {
-    int64_t idx = idx_n * dim * d + labels[ids] * d + idx_d;
-    if (labels[ids] == ignore_idx) {
-      loss[ids] = (paddle::platform::float16)0.0;
-    } else {
-      loss[ids] = -(paddle::platform::float16)std::log((float)softmax[idx]);
-    }
-  };
 };
 
 static __device__ __forceinline__ platform::float16 exp_on_device(
@@ -1148,8 +1141,6 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
                                             loss_data, n, dim, d);
       } else {
         if (!context.Attr<bool>("numeric_stable_mode")) {
-          // CUDNN kernel only suppoer 2-D tensor and perfome softmax on last
-          // dim
           Tensor logits_2d, softmax_2d, labels_2d, loss_2d;
           logits_2d.ShareDataWith(*logits).Resize({n, d * dim});
           softmax_2d.ShareDataWith(*softmax).Resize({n, d * dim});
