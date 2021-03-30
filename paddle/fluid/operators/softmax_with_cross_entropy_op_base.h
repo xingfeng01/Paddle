@@ -24,6 +24,13 @@ namespace cub = hipcub;
 
 #include "paddle/fluid/platform/cuda_device_function.h"
 
+#ifdef PADDLE_WITH_HIP
+#include "paddle/fluid/platform/miopen_helper.h"
+#else
+#include "paddle/fluid/platform/cudnn_helper.h"
+#endif
+#include "paddle/fluid/platform/gpu_launch_config.h"
+
 namespace paddle {
 namespace operators {
 
