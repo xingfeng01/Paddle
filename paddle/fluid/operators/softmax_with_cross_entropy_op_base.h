@@ -21,15 +21,15 @@ namespace cub = hipcub;
 #include "paddle/fluid/operators/math/math_function.h"
 #include "paddle/fluid/operators/softmax_with_cross_entropy_op.h"
 #include "paddle/fluid/platform/for_range.h"
-
+#include "paddle/fluid/operators/amp/fp16_type_traits.h"
 #include "paddle/fluid/platform/cuda_device_function.h"
-
+#include "paddle/fluid/platform/gpu_launch_config.h"
 #ifdef PADDLE_WITH_HIP
 #include "paddle/fluid/platform/miopen_helper.h"
 #else
 #include "paddle/fluid/platform/cudnn_helper.h"
 #endif
-#include "paddle/fluid/platform/gpu_launch_config.h"
+
 
 namespace paddle {
 namespace operators {
@@ -41,38 +41,38 @@ using Tensor = framework::Tensor;
 template <typename T>
 __device__ __forceinline__ T logT(T x) {
   return std::log(x);
-};
+}
 
 template <>
 __device__ __forceinline__ paddle::platform::float16 logT(
     paddle::platform::float16 x) {
   return (paddle::platform::float16)std::log((float)x);
-};
+}
 
 int inline log2_ceil(int value) {
   int log2_value = 0;
   while ((1 << log2_value) < value) ++log2_value;
   return log2_value;
-};
+}
 
-template <typename T, int BATCH_SIZE, int warp_size>
+template <typename T, int BatchSize, int WarpSize>
 __device__ __forceinline__ void WarpReduceSum(T* sum) {
 #pragma unroll
-  for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+  for (int offset = WarpSize / 2; offset > 0; offset /= 2) {
 #pragma unroll
-    for (int i = 0; i < BATCH_SIZE; ++i) {
+    for (int i = 0; i < BatchSize; ++i) {
       T sum_val = platform::CudaShuffleXorSync(0xFFFFFFFF, sum[i], offset);
       sum[i] = sum[i] + sum_val;
     }
   }
 }
 
-template <typename T, int BATCH_SIZE, int warp_size>
+template <typename T, int BatchSize, int WarpSize>
 __device__ __forceinline__ void WarpReduceMax(T* sum) {
 #pragma unroll
-  for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+  for (int offset = WarpSize / 2; offset > 0; offset /= 2) {
 #pragma unroll
-    for (int i = 0; i < BATCH_SIZE; ++i) {
+    for (int i = 0; i < BatchSize; ++i) {
       T max_val = platform::CudaShuffleXorSync(0xFFFFFFFF, sum[i], offset);
       sum[i] = max(sum[i], max_val);
     }
@@ -90,55 +90,55 @@ __global__ void CrossEntropyHardLabel(T* loss, const T* softmax,
   if (ids < n * d) {
     int64_t idx = idx_n * dim * d + labels[ids] * d + idx_d;
     if (labels[ids] == ignore_idx) {
-      loss[ids] = (T)0.0;
+      loss[ids] = static_cast<T>(0.0);
     } else {
       loss[ids] = -logT(softmax[idx]);
-    };
-  };
-};
+    }
+  }
+}
 
 template <typename T>
 __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
                                       const T* labels, const int n,
                                       const int dim, const int d) {
-  const int warp_size = 32;
-  const int BATCH_SIZE = 1;
-  int ITERATIONS = (dim + warp_size - 1) / warp_size;
+  const int kWarpSize = 32;
+  const int kBatchSize = 1;
+  int kIterations = (dim + kWarpSize - 1) / kWarpSize;
 
-  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * BATCH_SIZE;
+  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
   int local_batches = n * d - first_batch;
-  if (local_batches > BATCH_SIZE) {
-    local_batches = BATCH_SIZE;
-  };
+  if (local_batches > kBatchSize) {
+    local_batches = kBatchSize;
+  }
 
-  T sum[BATCH_SIZE]{(T)0.0};
-  for (int i = 0; i < BATCH_SIZE; ++i) {
+  T sum[kBatchSize]{static_cast<T>(0.0)};
+  for (int i = 0; i < kBatchSize; ++i) {
     if (i >= local_batches) break;
-    for (int it = 0; it < ITERATIONS; it++) {
+    for (int it = 0; it < kIterations; it++) {
       int ids = first_batch + i;
       int idx_n = ids / d;
       int idx_d = ids % d;
-      int idx_dim = it * warp_size + threadIdx.x;
+      int idx_dim = it * kWarpSize + threadIdx.x;
       int idx = idx_n * dim * d + idx_d + idx_dim * d;
       if (idx_dim < dim) {
         sum[i] -= logT(softmax[idx]) * labels[idx];
       }
-    };
-  };
-  WarpReduceSum<T, BATCH_SIZE, warp_size>(sum);
+    }
+  }
+  WarpReduceSum<T, kBatchSize, kWarpSize>(sum);
 
   // write
   if (threadIdx.x == 0) {
-    for (int i = 0; i < BATCH_SIZE; i++) {
+    for (int i = 0; i < kBatchSize; i++) {
       int ids = first_batch + i;
       if (ids < n * d) {
         loss[ids] = sum[0];
       }
     }
   }
-};
+}
 
-template <typename T, typename VECT, typename ACCT, int Log2Elements>
+template <typename T, typename VecT, typename AccT, int Log2Elements>
 __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
                                             const T* label,
                                             const int batch_size,
@@ -147,138 +147,138 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
   const bool isLog = true;
 
   constexpr int dim_ceil = 1 << Log2Elements;
-  constexpr int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
-  constexpr int VSIZE = sizeof(VECT) / sizeof(T);
-  constexpr int ITERATIONS = dim_ceil / warp_size;
-  constexpr int ITERATIONS_V = (ITERATIONS >= VSIZE) ? (ITERATIONS / VSIZE) : 1;
-  constexpr int BATCH_SIZE = (dim_ceil <= 128) ? 2 : 1;
+  constexpr int kWarpSize = (dim_ceil < 32) ? dim_ceil : 32;
+  constexpr int kVSize = sizeof(VecT) / sizeof(T);
+  constexpr int kIterations = dim_ceil / kWarpSize;
+  constexpr int kIterationsV = (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
+  constexpr int kBatchSize = (dim_ceil <= 128) ? 2 : 1;
 
-  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * BATCH_SIZE;
+  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
   int local_batches = batch_size - first_batch;
-  if (local_batches > BATCH_SIZE) {
-    local_batches = BATCH_SIZE;
-  };
+  if (local_batches > kBatchSize) {
+    local_batches = kBatchSize;
+  }
 
   // read data from global memory
-  VECT srcdata[BATCH_SIZE][ITERATIONS_V];
-  VECT labeldata[BATCH_SIZE][ITERATIONS_V];
+  VecT srcdata[kBatchSize][kIterationsV];
+  VecT labeldata[kBatchSize][kIterationsV];
 
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    const VECT* src_v =
-        reinterpret_cast<const VECT*>(&src[(first_batch + i) * stride]);
-    const VECT* label_v =
-        reinterpret_cast<const VECT*>(&label[(first_batch + i) * stride]);
+  for (int i = 0; i < kBatchSize; ++i) {
+    const VecT* src_v =
+        reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
+    const VecT* label_v =
+        reinterpret_cast<const VecT*>(&label[(first_batch + i) * stride]);
 
     // max index to read
     int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / VSIZE;
+    int idx_max_v = idx_max / kVSize;
 
     // read data
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      int src_idx = threadIdx.x + it * warp_size;
+    for (int it = 0; it < kIterationsV; ++it) {
+      int src_idx = threadIdx.x + it * kWarpSize;
       if (src_idx < idx_max_v) {
         srcdata[i][it] = src_v[src_idx];
         labeldata[i][it] = label_v[src_idx];
       } else {
 #pragma unroll
-        for (int s = 0; s < VSIZE; s++) {
+        for (int s = 0; s < kVSize; s++) {
           reinterpret_cast<T*>(&srcdata[i][it])[s] =
-              -std::numeric_limits<ACCT>::max();
+              -std::numeric_limits<AccT>::max();
           reinterpret_cast<T*>(&labeldata[i][it])[s] = 0.0;
-        };
-      };
-    };
-  };
-
-  // compute max value
-  ACCT max_value[BATCH_SIZE];
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    max_value[i] = -std::numeric_limits<ACCT>::infinity();
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-      T valmax = valvp[0];
-#pragma unroll
-      for (int s = 1; s < VSIZE; ++s) {
-        valmax = (valmax > valvp[s]) ? valmax : valvp[s];
-      }
-      max_value[i] =
-          (max_value[i] > (ACCT)valmax) ? max_value[i] : (ACCT)valmax;
-    };
-  };
-  WarpReduceMax<ACCT, BATCH_SIZE, warp_size>(max_value);
-
-  // compute sum
-  ACCT sum[BATCH_SIZE]{0.0};
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-#pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
-        if (isLog) {
-          sum[i] += std::exp((ACCT)valvp[s] - max_value[i]);
-        } else {
-          valvp[s] = std::exp((ACCT)valvp[s] - max_value[i]);
-          sum[i] += (ACCT)valvp[s];
         }
-      };
+      }
     }
   }
-  WarpReduceSum<ACCT, BATCH_SIZE, warp_size>(sum);
+
+  // compute max value
+  AccT max_value[kBatchSize];
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+    max_value[i] = -std::numeric_limits<AccT>::infinity();
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+      T valmax = srcptr_v[0];
+#pragma unroll
+      for (int s = 1; s < kVSize; ++s) {
+        valmax = (valmax > srcptr_v[s]) ? valmax : srcptr_v[s];
+      }
+      max_value[i] =
+          (max_value[i] > static_cast<AccT>(valmax)) ? max_value[i] : static_cast<AccT>(valmax);
+    }
+  }
+  WarpReduceMax<AccT, kBatchSize, kWarpSize>(max_value);
+
+  // compute sum
+  AccT sum[kBatchSize]{0.0};
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+#pragma unroll
+      for (int s = 0; s < kVSize; ++s) {
+        if (isLog) {
+          sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+        } else {
+          srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+          sum[i] += static_cast<AccT>(srcptr_v[s]);
+        }
+      }
+    }
+  }
+  WarpReduceSum<AccT, kBatchSize, kWarpSize>(sum);
 
   // log_softmax and loss
-  ACCT sumloss[BATCH_SIZE]{0.0};
+  AccT sumloss[kBatchSize]{0.0};
 #pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
+  for (int i = 0; i < kBatchSize; ++i) {
     if (i >= local_batches) break;
 
-    VECT* softmax_v =
-        reinterpret_cast<VECT*>(&softmax[(first_batch + i) * stride]);
+    VecT* softmax_v =
+        reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
 
     // max index to write
     int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / VSIZE;
+    int idx_max_v = idx_max / kVSize;
 
     if (isLog) {
       sum[i] = std::log(sum[i]);
     }
 #pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
+    for (int it = 0; it < kIterationsV; ++it) {
       T* srcvp = reinterpret_cast<T*>(&srcdata[i][it]);
       T* labelvp = reinterpret_cast<T*>(&labeldata[i][it]);
-      VECT tmpv;
+      VecT tmpv;
       T* tmpvp = reinterpret_cast<T*>(&tmpv);
 #pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
+      for (int s = 0; s < kVSize; ++s) {
         if (isLog) {
-          ACCT logsoftmax = (ACCT)srcvp[s] - max_value[i] - sum[i];
-          sumloss[i] -= logsoftmax * (ACCT)labelvp[s];
+          AccT logsoftmax = static_cast<AccT>(srcvp[s]) - max_value[i] - sum[i];
+          sumloss[i] -= logsoftmax * static_cast<AccT>(labelvp[s]);
           tmpvp[s] = std::exp(logsoftmax);
         } else {
-          tmpvp[s] = (ACCT)srcvp[s] / sum[i];
-        };
-      };
+          tmpvp[s] = static_cast<AccT>(srcvp[s]) / sum[i];
+        }
+      }
 
-      int idx = threadIdx.x + it * warp_size;
+      int idx = threadIdx.x + it * kWarpSize;
       if (idx < idx_max_v) {
         softmax_v[idx] = tmpv;
-      };
-    };
-  };
+      }
+    }
+  }
 
   // loss
-  WarpReduceSum<ACCT, BATCH_SIZE, warp_size>(sumloss);
+  WarpReduceSum<AccT, kBatchSize, kWarpSize>(sumloss);
 
-  for (int i = 0; i < BATCH_SIZE; i++) {
+  for (int i = 0; i < kBatchSize; i++) {
     if (i >= local_batches) break;
     loss[first_batch + i] = sumloss[i];
-  };
-};
+  }
+}
 
-template <typename T, typename VECT, typename ACCT, int Log2Elements>
+template <typename T, typename VecT, typename AccT, int Log2Elements>
 __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
                                             const int64_t* label,
                                             const int batch_size,
@@ -288,133 +288,133 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
   const bool isLog = true;
 
   constexpr int dim_ceil = 1 << Log2Elements;
-  constexpr int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
-  constexpr int VSIZE = sizeof(VECT) / sizeof(T);
-  constexpr int ITERATIONS = dim_ceil / warp_size;
-  constexpr int ITERATIONS_V = (ITERATIONS >= VSIZE) ? (ITERATIONS / VSIZE) : 1;
-  constexpr int BATCH_SIZE = (dim_ceil <= 128) ? 2 : 1;
+  constexpr int kWarpSize = (dim_ceil < 32) ? dim_ceil : 32;
+  constexpr int kVSize = sizeof(VecT) / sizeof(T);
+  constexpr int kIterations = dim_ceil / kWarpSize;
+  constexpr int kIterationsV = (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
+  constexpr int kBatchSize = (dim_ceil <= 128) ? 2 : 1;
 
-  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * BATCH_SIZE;
+  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
   int local_batches = batch_size - first_batch;
-  if (local_batches > BATCH_SIZE) {
-    local_batches = BATCH_SIZE;
-  };
+  if (local_batches > kBatchSize) {
+    local_batches = kBatchSize;
+  }
 
   // read data from global memory
-  VECT srcdata[BATCH_SIZE][ITERATIONS_V];
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    const VECT* src_v =
-        reinterpret_cast<const VECT*>(&src[(first_batch + i) * stride]);
+  VecT srcdata[kBatchSize][kIterationsV];
+  for (int i = 0; i < kBatchSize; ++i) {
+    const VecT* src_v =
+        reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
 
     // max index to read
     int src_idx_max = (i < local_batches) ? element_count : 0;
-    int src_idx_max_v = src_idx_max / VSIZE;
+    int src_idx_max_v = src_idx_max / kVSize;
 
     // read data
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      int src_idx = threadIdx.x + it * warp_size;
+    for (int it = 0; it < kIterationsV; ++it) {
+      int src_idx = threadIdx.x + it * kWarpSize;
       if (src_idx < src_idx_max_v) {
         srcdata[i][it] = src_v[src_idx];
       } else {
 #pragma unroll
-        for (int s = 0; s < VSIZE; s++) {
+        for (int s = 0; s < kVSize; s++) {
           reinterpret_cast<T*>(&srcdata[i][it])[s] =
-              -std::numeric_limits<ACCT>::infinity();
-        };
-      };
-    };
-  };
-
-  // compute max value
-  ACCT max_value[BATCH_SIZE];
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    max_value[i] = -std::numeric_limits<ACCT>::infinity();
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-      T valmax = valvp[0];
-#pragma unroll
-      for (int s = 1; s < VSIZE; ++s) {
-        valmax = (valmax > valvp[s]) ? valmax : valvp[s];
-      }
-      max_value[i] =
-          (max_value[i] > (ACCT)valmax) ? max_value[i] : (ACCT)valmax;
-    };
-  };
-  WarpReduceMax<ACCT, BATCH_SIZE, warp_size>(max_value);
-
-  // compute sum
-  ACCT sum[BATCH_SIZE]{0.0};
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-#pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
-        if (isLog) {
-          sum[i] += std::exp((ACCT)valvp[s] - max_value[i]);
-        } else {
-          valvp[s] = std::exp((ACCT)valvp[s] - max_value[i]);
-          sum[i] += (ACCT)valvp[s];
+              -std::numeric_limits<AccT>::infinity();
         }
-      };
+      }
     }
   }
-  WarpReduceSum<ACCT, BATCH_SIZE, warp_size>(sum);
+
+  // compute max value
+  AccT max_value[kBatchSize];
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+    max_value[i] = -std::numeric_limits<AccT>::infinity();
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+      T valmax = srcptr_v[0];
+#pragma unroll
+      for (int s = 1; s < kVSize; ++s) {
+        valmax = (valmax > srcptr_v[s]) ? valmax : srcptr_v[s];
+      }
+      max_value[i] =
+          (max_value[i] > static_cast<AccT>(valmax)) ? max_value[i] : static_cast<AccT>(valmax);
+    }
+  }
+  WarpReduceMax<AccT, kBatchSize, kWarpSize>(max_value);
+
+  // compute sum
+  AccT sum[kBatchSize]{0.0};
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+#pragma unroll
+      for (int s = 0; s < kVSize; ++s) {
+        if (isLog) {
+          sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+        } else {
+          srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+          sum[i] += static_cast<AccT>(srcptr_v[s]);
+        }
+      }
+    }
+  }
+  WarpReduceSum<AccT, kBatchSize, kWarpSize>(sum);
 
   // log_softmax
-  VECT* softmax_v = reinterpret_cast<VECT*>(softmax);
+  VecT* softmax_v = reinterpret_cast<VecT*>(softmax);
 #pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
+  for (int i = 0; i < kBatchSize; ++i) {
     if (i >= local_batches) break;
 
-    VECT* softmax_v =
-        reinterpret_cast<VECT*>(&softmax[(first_batch + i) * stride]);
+    VecT* softmax_v =
+        reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
 
     // max index to write
     int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / VSIZE;
+    int idx_max_v = idx_max / kVSize;
 
     if (isLog) {
       sum[i] = std::log(sum[i]);
     }
 #pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
+    for (int it = 0; it < kIterationsV; ++it) {
       T* srcvp = reinterpret_cast<T*>(&srcdata[i][it]);
-      VECT tmpv;
+      VecT tmpv;
       T* tmpvp = reinterpret_cast<T*>(&tmpv);
 #pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
+      for (int s = 0; s < kVSize; ++s) {
         if (isLog) {
-          ACCT logsoftmax = (ACCT)srcvp[s] - max_value[i] - sum[i];
+          AccT logsoftmax = static_cast<AccT>(srcvp[s]) - max_value[i] - sum[i];
           tmpvp[s] = std::exp(logsoftmax);
 
-          int loss_idx = (threadIdx.x + it * warp_size) * VSIZE + s;
+          int loss_idx = (threadIdx.x + it * kWarpSize) * kVSize + s;
           if (label[first_batch + i] == loss_idx) {
             if (label[first_batch + i] != ignore_index) {
               loss[first_batch + i] = -logsoftmax;
             } else {
-              loss[first_batch + i] = (T)0.0;
+              loss[first_batch + i] = static_cast<T>(0.0);
             }
           }
         } else {
-          tmpvp[s] = (ACCT)srcvp[s] / sum[i];
-        };
-      };
+          tmpvp[s] = static_cast<AccT>(srcvp[s]) / sum[i];
+        }
+      }
 
-      int idx = threadIdx.x + it * warp_size;
+      int idx = threadIdx.x + it * kWarpSize;
       if (idx < idx_max_v) {
         softmax_v[idx] = tmpv;
-      };
-    };
-  };
-};
+      }
+    }
+  }
+}
 
-#define SOFTMAX_WARP_FORWARD_SOFT_CASE(Log2Elements, VECT, ACCT)               \
+#define SOFTMAX_WARP_FORWARD_SOFT_CASE(Log2Elements, VecT, AccT)               \
   case Log2Elements:                                                           \
-    WarpSoftmaxForwardSoftLabel<T, VECT, ACCT,                                 \
+    WarpSoftmaxForwardSoftLabel<T, VecT, AccT,                                 \
                                 Log2Elements><<<blocks, threads, 0, stream>>>( \
         loss, softmax, src, label, batch_size, stride, element_count);         \
     break;
@@ -426,52 +426,53 @@ void SwitchWarpSoftmaxForwardSoftLabel(const int blocks, const dim3 threads,
                                        const int batch_size, const int stride,
                                        const int element_count,
                                        const int Log2Elements) {
+  using AccT = typename details::MPTypeTrait<T>::Type;                                       
   switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(0, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(1, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(2, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(3, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(4, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(5, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(6, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(7, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(8, T, T);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(9, T, T);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(0, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(1, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(2, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(3, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(4, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(5, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(6, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(7, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(8, T, AccT);
+    SOFTMAX_WARP_FORWARD_SOFT_CASE(9, T, AccT);
     default:
       break;
-  };
-};
+  }
+}
 
-template <>
-void SwitchWarpSoftmaxForwardSoftLabel<paddle::platform::float16>(
-    const int blocks, const dim3 threads, gpuStream_t stream,
-    paddle::platform::float16* loss, paddle::platform::float16* softmax,
-    const paddle::platform::float16* src,
-    const paddle::platform::float16* label, const int batch_size,
-    const int stride, const int element_count, int Log2Elements) {
-#define T paddle::platform::float16
-  switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(0, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(1, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(2, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(3, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(4, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(5, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(6, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(7, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(8, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_SOFT_CASE(9, paddle::platform::float16, float);
-    default:
-      break;
-  };
-#undef T
-};
+// template <>
+// void SwitchWarpSoftmaxForwardSoftLabel<paddle::platform::float16>(
+//     const int blocks, const dim3 threads, gpuStream_t stream,
+//     paddle::platform::float16* loss, paddle::platform::float16* softmax,
+//     const paddle::platform::float16* src,
+//     const paddle::platform::float16* label, const int batch_size,
+//     const int stride, const int element_count, int Log2Elements) {
+// #define T paddle::platform::float16
+//   switch (Log2Elements) {
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(0, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(1, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(2, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(3, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(4, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(5, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(6, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(7, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(8, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_SOFT_CASE(9, paddle::platform::float16, float);
+//     default:
+//       break;
+//   };
+// #undef T
+// };
 
 #undef SOFTMAX_WARP_FORWARD_SOFT_CASE
 
-#define SOFTMAX_WARP_FORWARD_HARD_CASE(Log2Elements, VECT, ACCT)               \
+#define SOFTMAX_WARP_FORWARD_HARD_CASE(Log2Elements, VecT, AccT)               \
   case Log2Elements:                                                           \
-    WarpSoftmaxForwardHardLabel<T, VECT, ACCT,                                 \
+    WarpSoftmaxForwardHardLabel<T, VecT, AccT,                                 \
                                 Log2Elements><<<blocks, threads, 0, stream>>>( \
         loss, softmax, src, label, batch_size, stride, element_count,          \
         ignore_index);                                                         \
@@ -485,46 +486,47 @@ void SwitchWarpSoftmaxForwardHardLabel(const int blocks, const dim3 threads,
                                        const int element_count,
                                        int Log2Elements,
                                        const int ignore_index) {
+  using AccT = typename details::MPTypeTrait<T>::Type;   
   switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_HARD_CASE(0, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(1, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(2, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(3, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(4, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(5, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(6, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(7, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(8, T, T);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(9, T, T);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(0, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(1, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(2, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(3, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(4, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(5, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(6, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(7, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(8, T, AccT);
+    SOFTMAX_WARP_FORWARD_HARD_CASE(9, T, AccT);
     default:
       break;
-  };
-};
+  }
+}
 
-template <>
-void SwitchWarpSoftmaxForwardHardLabel<paddle::platform::float16>(
-    const int blocks, const dim3 threads, gpuStream_t stream,
-    paddle::platform::float16* loss, paddle::platform::float16* softmax,
-    const paddle::platform::float16* src, const int64_t* label,
-    const int batch_size, const int stride, const int element_count,
-    int Log2Elements, const int ignore_index) {
-#define T paddle::platform::float16
-  switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_HARD_CASE(0, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(1, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(2, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(3, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(4, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(5, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(6, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(7, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(8, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_HARD_CASE(9, paddle::platform::float16, float);
-    default:
-      break;
-  };
-#undef T
-};
+// template <>
+// void SwitchWarpSoftmaxForwardHardLabel<paddle::platform::float16>(
+//     const int blocks, const dim3 threads, gpuStream_t stream,
+//     paddle::platform::float16* loss, paddle::platform::float16* softmax,
+//     const paddle::platform::float16* src, const int64_t* label,
+//     const int batch_size, const int stride, const int element_count,
+//     int Log2Elements, const int ignore_index) {
+// #define T paddle::platform::float16
+//   switch (Log2Elements) {
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(0, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(1, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(2, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(3, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(4, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(5, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(6, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(7, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(8, paddle::platform::float16, float);
+//     SOFTMAX_WARP_FORWARD_HARD_CASE(9, paddle::platform::float16, float);
+//     default:
+//       break;
+//   };
+// #undef T
+// };
 
 template <typename T>
 static void SoftmaxWithCrossEntropyHardLabel(
@@ -568,15 +570,15 @@ static void SoftmaxWithCrossEntropyHardLabel(
   if (D == 1 && dim <= max_dim) {
     const int dim_log2 = static_cast<int>(log2_ceil(dim));
     const int dim_ceil = 1 << dim_log2;
-    int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
+    int kWarpSize = (dim_ceil < 32) ? dim_ceil : 32;
     int batches_per_warp = (dim_ceil <= 128) ? 2 : 1;
 
     // use 128 threads per block to maximimize gpu utilization
     constexpr int threads_per_block = 128;
-    int warps_per_block = (threads_per_block / warp_size);
+    int warps_per_block = (threads_per_block / kWarpSize);
     int batches_per_block = warps_per_block * batches_per_warp;
     int blocks = (N + batches_per_block - 1) / batches_per_block;
-    dim3 threads(warp_size, warps_per_block, 1);
+    dim3 threads(kWarpSize, warps_per_block, 1);
 
     SwitchWarpSoftmaxForwardHardLabel<T>(
         blocks, threads, ctx.cuda_device_context().stream(), loss_data,
@@ -613,8 +615,8 @@ static void SoftmaxWithCrossEntropyHardLabel(
     int blocks = (N * D + threads - 1) / threads;
     CrossEntropyHardLabel<T><<<blocks, threads>>>(
         loss_data, softmax_data, labels_data, N, dim, D, ignore_index);
-  };
-};
+  }
+}
 
 template <typename T>
 static void SoftmaxWithCrossEntropySoftLabel(
@@ -651,15 +653,15 @@ static void SoftmaxWithCrossEntropySoftLabel(
   if (D == 1 && dim <= max_dim) {
     const int dim_log2 = static_cast<int>(log2_ceil(dim));
     const int dim_ceil = 1 << dim_log2;
-    int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
+    int kWarpSize = (dim_ceil < 32) ? dim_ceil : 32;
     int batches_per_warp = (dim_ceil <= 128) ? 2 : 1;
 
     // use 128 threads per block to maximimize gpu utilization
     constexpr int threads_per_block = 128;
-    int warps_per_block = (threads_per_block / warp_size);
+    int warps_per_block = (threads_per_block / kWarpSize);
     int batches_per_block = warps_per_block * batches_per_warp;
     int blocks = (N + batches_per_block - 1) / batches_per_block;
-    dim3 threads(warp_size, warps_per_block, 1);
+    dim3 threads(kWarpSize, warps_per_block, 1);
 
     SwitchWarpSoftmaxForwardSoftLabel<T>(
         blocks, threads, ctx.cuda_device_context().stream(), loss_data,
@@ -693,14 +695,14 @@ static void SoftmaxWithCrossEntropySoftLabel(
         platform::CudnnDataType<T>::kZero(), desc_, softmax_data));
 #endif
 
-    int warp_size = 32;  // (dim < 32) ? dim : 32;
+    int kWarpSize = 32;  // (dim < 32) ? dim : 32;
     int batches_per_warp = 1;
 
     // use 128 threads per block to maximimize gpu utilization
     constexpr int threads_per_block = 128;
     int batches_per_block = warps_per_block * batches_per_warp;
     int blocks = (N * D + batches_per_block - 1) / batches_per_block;
-    dim3 threads(warp_size, warps_per_block, 1);
+    dim3 threads(kWarpSize, warps_per_block, 1);
 
     CrossEntropySoftLabel<T><<<blocks, threads>>>(loss_data, softmax_data,
                                                   labels_data, N, dim, D);
