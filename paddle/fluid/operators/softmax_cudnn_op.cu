@@ -37,263 +37,268 @@ using ScopedTensorDescriptor = platform::ScopedTensorDescriptor;
 using DataLayout = platform::DataLayout;
 using Tensor = framework::Tensor;
 
-int log2_ceil(int value) {
+int inline log2_ceil(int value) {
   int log2_value = 0;
   while ((1 << log2_value) < value) ++log2_value;
   return log2_value;
 }
 
-template <typename T, int BATCH_SIZE, int warp_size>
+template <typename T, int BatchSize, int WarpSize>
 __device__ __forceinline__ void WarpReduceSum(T* sum) {
 #pragma unroll
-  for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+  for (int offset = WarpSize / 2; offset > 0; offset /= 2) {
 #pragma unroll
-    for (int i = 0; i < BATCH_SIZE; ++i) {
+    for (int i = 0; i < BatchSize; ++i) {
       T sum_val = platform::CudaShuffleXorSync(0xFFFFFFFF, sum[i], offset);
       sum[i] = sum[i] + sum_val;
     }
   }
 }
 
-template <typename T, int BATCH_SIZE, int warp_size>
+template <typename T, int BatchSize, int WarpSize>
 __device__ __forceinline__ void WarpReduceMax(T* sum) {
 #pragma unroll
-  for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+  for (int offset = WarpSize / 2; offset > 0; offset /= 2) {
 #pragma unroll
-    for (int i = 0; i < BATCH_SIZE; ++i) {
+    for (int i = 0; i < BatchSize; ++i) {
       T max_val = platform::CudaShuffleXorSync(0xFFFFFFFF, sum[i], offset);
       sum[i] = max(sum[i], max_val);
     }
   }
 }
 
-template <typename T, typename VECT, typename ACCT, int Log2Elements,
+template <typename T, typename VecT, typename AccT, int Log2Elements,
           bool isLog = false>
 __global__ void WarpSoftmaxForward(T* softmax, const T* src,
                                    const int batch_size, const int stride,
                                    const int element_count) {
-  constexpr int dim_ceil = 1 << Log2Elements;
-  constexpr int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
-  constexpr int VSIZE = sizeof(VECT) / sizeof(T);
-  constexpr int ITERATIONS = dim_ceil / warp_size;
-  constexpr int ITERATIONS_V = (ITERATIONS >= VSIZE) ? (ITERATIONS / VSIZE) : 1;
-  constexpr int BATCH_SIZE = (dim_ceil <= 128) ? 2 : 1;
+  constexpr int kDimCeil = 1 << Log2Elements;
+  constexpr int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
+  constexpr int kVSize = sizeof(VecT) / sizeof(T);
+  constexpr int kIterations = kDimCeil / kWarpSize;
+  constexpr int kIterationsV =
+      (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
+  constexpr int kBatchSize = (kDimCeil <= 128) ? 2 : 1;
 
-  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * BATCH_SIZE;
+  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
   int local_batches = batch_size - first_batch;
-  if (local_batches > BATCH_SIZE) {
-    local_batches = BATCH_SIZE;
-  };
+  if (local_batches > kBatchSize) {
+    local_batches = kBatchSize;
+  }
 
   // read data from global memory
-  VECT srcdata[BATCH_SIZE][ITERATIONS_V];
+  VecT srcdata[kBatchSize][kIterationsV];
 
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    const VECT* src_v =
-        reinterpret_cast<const VECT*>(&src[(first_batch + i) * stride]);
+  for (int i = 0; i < kBatchSize; ++i) {
+    const VecT* src_v =
+        reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
     // max index to read
     int src_idx_max = (i < local_batches) ? element_count : 0;
-    int src_idx_max_v = src_idx_max / VSIZE;
+    int src_idx_max_v = src_idx_max / kVSize;
 
     // read data
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      int src_idx = threadIdx.x + it * warp_size;
+    for (int it = 0; it < kIterationsV; ++it) {
+      int src_idx = threadIdx.x + it * kWarpSize;
       if (src_idx < src_idx_max_v) {
         srcdata[i][it] = src_v[src_idx];
       } else {
 #pragma unroll
-        for (int s = 0; s < VSIZE; s++) {
+        for (int s = 0; s < kVSize; s++) {
           reinterpret_cast<T*>(&srcdata[i][it])[s] =
-              -std::numeric_limits<ACCT>::infinity();
-        };
-      };
-    };
-  };
-
-  // compute max value
-  ACCT max_value[BATCH_SIZE];
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    max_value[i] = -std::numeric_limits<ACCT>::infinity();
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-      T valmax = valvp[0];
-#pragma unroll
-      for (int s = 1; s < VSIZE; ++s) {
-        valmax = (valmax > valvp[s]) ? valmax : valvp[s];
-      }
-      max_value[i] =
-          (max_value[i] > (ACCT)valmax) ? max_value[i] : (ACCT)valmax;
-    };
-  };
-  WarpReduceMax<ACCT, BATCH_SIZE, warp_size>(max_value);
-
-  // compute sum
-  ACCT sum[BATCH_SIZE]{0.0};
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-#pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
-        if (isLog) {
-          sum[i] += std::exp((ACCT)valvp[s] - max_value[i]);
-        } else {
-          valvp[s] = std::exp((ACCT)valvp[s] - max_value[i]);
-          sum[i] += (ACCT)valvp[s];
+              -std::numeric_limits<AccT>::infinity();
         }
-      };
+      }
     }
   }
-  WarpReduceSum<ACCT, BATCH_SIZE, warp_size>(sum);
+
+  // compute max value
+  AccT max_value[kBatchSize];
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+    max_value[i] = -std::numeric_limits<AccT>::infinity();
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+      T valmax = srcptr_v[0];
+#pragma unroll
+      for (int s = 1; s < kVSize; ++s) {
+        valmax = (valmax > srcptr_v[s]) ? valmax : srcptr_v[s];
+      }
+      max_value[i] = (max_value[i] > static_cast<AccT>(valmax))
+                         ? max_value[i]
+                         : static_cast<AccT>(valmax);
+    }
+  }
+  WarpReduceMax<AccT, kBatchSize, kWarpSize>(max_value);
+
+  // compute sum
+  AccT sum[kBatchSize]{0.0};
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+#pragma unroll
+      for (int s = 0; s < kVSize; ++s) {
+        if (isLog) {
+          sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+        } else {
+          srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+          sum[i] += static_cast<AccT>(srcptr_v[s]);
+        }
+      }
+    }
+  }
+  WarpReduceSum<AccT, kBatchSize, kWarpSize>(sum);
 
   // write result to global memory
-  VECT* softmax_v = reinterpret_cast<VECT*>(softmax);
+  VecT* softmax_v = reinterpret_cast<VecT*>(softmax);
 #pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
+  for (int i = 0; i < kBatchSize; ++i) {
     if (i >= local_batches) break;
 
-    VECT* softmax_v =
-        reinterpret_cast<VECT*>(&softmax[(first_batch + i) * stride]);
+    VecT* softmax_v =
+        reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
 
     // max index to write
     int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / VSIZE;
+    int idx_max_v = idx_max / kVSize;
 
     if (isLog) {
       sum[i] = std::log(sum[i]);
     }
 #pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvp = reinterpret_cast<T*>(&srcdata[i][it]);
-      VECT tmpv;
-      T* tmpvp = reinterpret_cast<T*>(&tmpv);
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
+      VecT tmpdata;
+      T* tmpptr = reinterpret_cast<T*>(&tmpdata);
 #pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
+      for (int s = 0; s < kVSize; ++s) {
         if (isLog) {
-          tmpvp[s] = (ACCT)valvp[s] - max_value[i] - sum[i];
+          tmpptr[s] = static_cast<AccT>(srcptr_v[s]) - max_value[i] - sum[i];
         } else {
-          tmpvp[s] = (ACCT)valvp[s] / sum[i];
-        };
-      };
+          tmpptr[s] = static_cast<AccT>(srcptr_v[s]) / sum[i];
+        }
+      }
 
-      int idx = threadIdx.x + it * warp_size;
+      int idx = threadIdx.x + it * kWarpSize;
       if (idx < idx_max_v) {
-        softmax_v[idx] = tmpv;
-      };
-    };
-  };
-};
+        softmax_v[idx] = tmpdata;
+      }
+    }
+  }
+}
 
-template <typename T, typename VECT, typename ACCT, int Log2Elements,
+template <typename T, typename VecT, typename AccT, int Log2Elements,
           bool isLog = false>
 __global__ void WarpSoftmaxBackward(T* dst, const T* grad, const T* src,
                                     int batch_size, int stride,
                                     int element_count) {
-  constexpr int VSIZE = sizeof(VECT) / sizeof(T);
-  constexpr int dim_ceil = 1 << Log2Elements;
-  constexpr int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
-  constexpr int ITERATIONS = dim_ceil / warp_size;
-  constexpr int BATCH_SIZE = (dim_ceil <= 128) ? 2 : 1;
-  constexpr int ITERATIONS_V = (ITERATIONS >= VSIZE) ? (ITERATIONS / VSIZE) : 1;
-  int element_count_v = element_count / VSIZE;
+  constexpr int kVSize = sizeof(VecT) / sizeof(T);
+  constexpr int kDimCeil = 1 << Log2Elements;
+  constexpr int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
+  constexpr int kIterations = kDimCeil / kWarpSize;
+  constexpr int kBatchSize = (kDimCeil <= 128) ? 2 : 1;
+  constexpr int kIterationsV =
+      (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
+  int element_count_v = element_count / kVSize;
 
-  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * BATCH_SIZE;
+  int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
   int local_batches = batch_size - first_batch;
-  if (local_batches > BATCH_SIZE) {
-    local_batches = BATCH_SIZE;
-  };
+  if (local_batches > kBatchSize) {
+    local_batches = kBatchSize;
+  }
 
   // read data from global memory
-  VECT src_reg[BATCH_SIZE][ITERATIONS_V];
-  VECT grad_reg[BATCH_SIZE][ITERATIONS_V];
+  VecT src_reg[kBatchSize][kIterationsV];
+  VecT grad_reg[kBatchSize][kIterationsV];
 
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-    const VECT* src_v =
-        reinterpret_cast<const VECT*>(&src[(first_batch + i) * stride]);
-    const VECT* grad_v =
-        reinterpret_cast<const VECT*>(&grad[(first_batch + i) * stride]);
+  for (int i = 0; i < kBatchSize; ++i) {
+    const VecT* src_v =
+        reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
+    const VecT* grad_v =
+        reinterpret_cast<const VecT*>(&grad[(first_batch + i) * stride]);
 
     // max index to read
     int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / VSIZE;
+    int idx_max_v = idx_max / kVSize;
 
     // read data
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      int src_idx = threadIdx.x + it * warp_size;
+    for (int it = 0; it < kIterationsV; ++it) {
+      int src_idx = threadIdx.x + it * kWarpSize;
       if (src_idx < idx_max_v) {
         src_reg[i][it] = src_v[src_idx];
         grad_reg[i][it] = grad_v[src_idx];
       } else {
 #pragma unroll
-        for (int s = 0; s < VSIZE; s++) {
+        for (int s = 0; s < kVSize; s++) {
           reinterpret_cast<T*>(&src_reg[i][it])[s] = 0.0;
           reinterpret_cast<T*>(&grad_reg[i][it])[s] = 0.0;
-        };
-      };
-    };
-  };
-
-  // compute sum
-  ACCT sum[BATCH_SIZE]{0.0};
-#pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
-#pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      T* valvpg = reinterpret_cast<T*>(&grad_reg[i][it]);
-      T* valvps = reinterpret_cast<T*>(&src_reg[i][it]);
-#pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
-        if (isLog) {
-          sum[i] += (ACCT)valvpg[s];
-        } else {
-          sum[i] += (ACCT)(valvpg[s] * valvps[s]);
         }
-      };
+      }
     }
   }
-  WarpReduceSum<ACCT, BATCH_SIZE, warp_size>(sum);
+
+  // compute sum
+  AccT sum[kBatchSize]{0.0};
+#pragma unroll
+  for (int i = 0; i < kBatchSize; ++i) {
+#pragma unroll
+    for (int it = 0; it < kIterationsV; ++it) {
+      T* gradptr = reinterpret_cast<T*>(&grad_reg[i][it]);
+      T* srcptr = reinterpret_cast<T*>(&src_reg[i][it]);
+#pragma unroll
+      for (int s = 0; s < kVSize; ++s) {
+        if (isLog) {
+          sum[i] += static_cast<AccT>(gradptr[s]);
+        } else {
+          sum[i] += static_cast<AccT>(gradptr[s] * srcptr[s]);
+        }
+      }
+    }
+  }
+  WarpReduceSum<AccT, kBatchSize, kWarpSize>(sum);
 
 // write result
 #pragma unroll
-  for (int i = 0; i < BATCH_SIZE; ++i) {
+  for (int i = 0; i < kBatchSize; ++i) {
     if (i >= local_batches) break;
 
-    VECT* dst_v = reinterpret_cast<VECT*>(&dst[(first_batch + i) * stride]);
+    VecT* dst_v = reinterpret_cast<VecT*>(&dst[(first_batch + i) * stride]);
 
     // max index to write
     int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / VSIZE;
+    int idx_max_v = idx_max / kVSize;
 
 #pragma unroll
-    for (int it = 0; it < ITERATIONS_V; ++it) {
-      VECT tmpv;
-      T* tmpvp = reinterpret_cast<T*>(&tmpv);
-      T* valvpg = reinterpret_cast<T*>(&grad_reg[i][it]);
-      T* valvps = reinterpret_cast<T*>(&src_reg[i][it]);
+    for (int it = 0; it < kIterationsV; ++it) {
+      VecT tmpdata;
+      T* tmpptr = reinterpret_cast<T*>(&tmpdata);
+      T* gradptr = reinterpret_cast<T*>(&grad_reg[i][it]);
+      T* srcptr = reinterpret_cast<T*>(&src_reg[i][it]);
 #pragma unroll
-      for (int s = 0; s < VSIZE; ++s) {
+      for (int s = 0; s < kVSize; ++s) {
         if (isLog) {
-          tmpvp[s] = (ACCT)valvpg[s] - std::exp((ACCT)valvps[s]) * sum[i];
+          tmpptr[s] = static_cast<AccT>(gradptr[s]) -
+                      std::exp(static_cast<AccT>(srcptr[s])) * sum[i];
         } else {
-          tmpvp[s] = (ACCT)valvps[s] * ((ACCT)valvpg[s] - sum[i]);
-        };
-      };
+          tmpptr[s] = static_cast<AccT>(srcptr[s]) *
+                      (static_cast<AccT>(gradptr[s]) - sum[i]);
+        }
+      }
 
-      int idx = threadIdx.x + it * warp_size;
+      int idx = threadIdx.x + it * kWarpSize;
       if (idx < idx_max_v) {
-        dst_v[idx] = tmpv;
-      };
-    };
-  };
-};
+        dst_v[idx] = tmpdata;
+      }
+    }
+  }
+}
 
-#define SOFTMAX_WARP_FORWARD_CASE(Log2Elements, VECT, ACCT)                 \
+#define SOFTMAX_WARP_FORWARD_CASE(Log2Elements, VecT, AccT)                 \
   case Log2Elements:                                                        \
     WarpSoftmaxForward<                                                     \
-        T, VECT, ACCT, Log2Elements,                                        \
+        T, VecT, AccT, Log2Elements,                                        \
         isLog><<<blocks, threads, 0, ctx.cuda_device_context().stream()>>>( \
         dst, src, batch_size, stride, element_count);                       \
     break;
@@ -317,8 +322,8 @@ void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
     SOFTMAX_WARP_FORWARD_CASE(9, T, T);
     default:
       break;
-  };
-};
+  }
+}
 
 template <>
 void SwitchWarpSoftmaxForward<paddle::platform::float16, false>(
@@ -341,10 +346,10 @@ void SwitchWarpSoftmaxForward<paddle::platform::float16, false>(
     SOFTMAX_WARP_FORWARD_CASE(9, paddle::platform::float16, float);
     default:
       break;
-  };
+  }
 #undef T
 #undef isLog
-};
+}
 
 template <>
 void SwitchWarpSoftmaxForward<paddle::platform::float16, true>(
@@ -367,17 +372,17 @@ void SwitchWarpSoftmaxForward<paddle::platform::float16, true>(
     SOFTMAX_WARP_FORWARD_CASE(9, paddle::platform::float16, float);
     default:
       break;
-  };
+  }
 #undef T
 #undef isLog
-};
+}
 
 #undef SOFTMAX_WARP_FORWARD_CASE
 
-#define SOFTMAX_WARP_BACKWARD_CASE(Log2Elements, VECT, ACCT)                \
+#define SOFTMAX_WARP_BACKWARD_CASE(Log2Elements, VecT, AccT)                \
   case Log2Elements:                                                        \
     WarpSoftmaxBackward<                                                    \
-        T, VECT, ACCT, Log2Elements,                                        \
+        T, VecT, AccT, Log2Elements,                                        \
         isLog><<<blocks, threads, 0, ctx.cuda_device_context().stream()>>>( \
         dst, grad, src, batch_size, stride, element_count);                 \
     break;
@@ -401,8 +406,8 @@ void SwitchWarpSoftmaxBackward(const int blocks, const dim3 threads,
     SOFTMAX_WARP_BACKWARD_CASE(9, T, T);
     default:
       break;
-  };
-};
+  }
+}
 
 template <>
 void SwitchWarpSoftmaxBackward<paddle::platform::float16, false>(
@@ -426,10 +431,10 @@ void SwitchWarpSoftmaxBackward<paddle::platform::float16, false>(
     SOFTMAX_WARP_BACKWARD_CASE(9, paddle::platform::float16, float);
     default:
       break;
-  };
+  }
 #undef T
 #undef isLog
-};
+}
 
 template <>
 void SwitchWarpSoftmaxBackward<paddle::platform::float16, true>(
@@ -453,10 +458,10 @@ void SwitchWarpSoftmaxBackward<paddle::platform::float16, true>(
     SOFTMAX_WARP_BACKWARD_CASE(9, paddle::platform::float16, float);
     default:
       break;
-  };
+  }
 #undef T
 #undef isLog
-};
+}
 
 #undef SwitchWarpSoftmaxBackward
 
@@ -481,17 +486,17 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
 
     if (D == 1 && dim <= max_dim && sizeof(T) <= 4) {
       const int dim_log2 = static_cast<int>(log2_ceil(dim));
-      const int dim_ceil = 1 << dim_log2;
-      int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
-      int batches_per_warp = (dim_ceil <= 128) ? 2 : 1;
+      const int kDimCeil = 1 << dim_log2;
+      int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
+      int batches_per_warp = (kDimCeil <= 128) ? 2 : 1;
 
       // use 128 threads per block to maximimize gpu utilization
       constexpr int threads_per_block = 128;
 
-      int warps_per_block = (threads_per_block / warp_size);
+      int warps_per_block = (threads_per_block / kWarpSize);
       int batches_per_block = warps_per_block * batches_per_warp;
       int blocks = (N + batches_per_block - 1) / batches_per_block;
-      dim3 threads(warp_size, warps_per_block, 1);
+      dim3 threads(kWarpSize, warps_per_block, 1);
 
       SwitchWarpSoftmaxForward<T, isLog>(blocks, threads, ctx, out_data,
                                          x->data<T>(), N, dim, dim, dim_log2);
@@ -557,15 +562,15 @@ class SoftmaxGradCUDNNKernel : public framework::OpKernel<T> {
 
     if (D == 1 && dim <= max_dim && sizeof(T) <= 4) {
       const int dim_log2 = log2_ceil(dim);
-      const int dim_ceil = 1 << dim_log2;
-      int warp_size = (dim_ceil < 32) ? dim_ceil : 32;
-      int batches_per_warp = (dim_ceil <= 128) ? 2 : 1;
+      const int kDimCeil = 1 << dim_log2;
+      int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
+      int batches_per_warp = (kDimCeil <= 128) ? 2 : 1;
       constexpr int threads_per_block = 128;
 
-      int warps_per_block = (threads_per_block / warp_size);
+      int warps_per_block = (threads_per_block / kWarpSize);
       int batches_per_block = warps_per_block * batches_per_warp;
       int blocks = (N + batches_per_block - 1) / batches_per_block;
-      dim3 threads(warp_size, warps_per_block, 1);
+      dim3 threads(kWarpSize, warps_per_block, 1);
 
       SwitchWarpSoftmaxBackward<T, isLog>(blocks, threads, ctx, dx_data,
                                           dout->data<T>(), out->data<T>(), N,
