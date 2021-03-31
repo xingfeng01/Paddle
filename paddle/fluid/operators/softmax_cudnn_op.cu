@@ -13,15 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/operators/amp/fp16_type_traits.h"
 #include "paddle/fluid/operators/math/math_cuda_utils.h"
+#include "paddle/fluid/operators/softmax_impl.cuh"
 #include "paddle/fluid/operators/softmax_op.h"
 #include "paddle/fluid/platform/cuda_device_function.h"
+#include "paddle/fluid/platform/gpu_launch_config.h"
 #ifdef PADDLE_WITH_HIP
 #include "paddle/fluid/platform/miopen_helper.h"
 #else
 #include "paddle/fluid/platform/cudnn_helper.h"
 #endif
-#include "paddle/fluid/platform/gpu_launch_config.h"
 
 namespace paddle {
 namespace platform {
@@ -41,30 +43,6 @@ int inline log2_ceil(int value) {
   int log2_value = 0;
   while ((1 << log2_value) < value) ++log2_value;
   return log2_value;
-}
-
-template <typename T, int BatchSize, int WarpSize>
-__device__ __forceinline__ void WarpReduceSum(T* sum) {
-#pragma unroll
-  for (int offset = WarpSize / 2; offset > 0; offset /= 2) {
-#pragma unroll
-    for (int i = 0; i < BatchSize; ++i) {
-      T sum_val = platform::CudaShuffleXorSync(0xFFFFFFFF, sum[i], offset);
-      sum[i] = sum[i] + sum_val;
-    }
-  }
-}
-
-template <typename T, int BatchSize, int WarpSize>
-__device__ __forceinline__ void WarpReduceMax(T* sum) {
-#pragma unroll
-  for (int offset = WarpSize / 2; offset > 0; offset /= 2) {
-#pragma unroll
-    for (int i = 0; i < BatchSize; ++i) {
-      T max_val = platform::CudaShuffleXorSync(0xFFFFFFFF, sum[i], offset);
-      sum[i] = max(sum[i], max_val);
-    }
-  }
 }
 
 template <typename T, typename VecT, typename AccT, int Log2Elements,
@@ -309,75 +287,22 @@ void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
                               const T* src, const int batch_size,
                               const int stride, const int element_count,
                               int Log2Elements) {
+  using AccT = typename details::MPTypeTrait<T>::Type;
   switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_CASE(0, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(1, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(2, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(3, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(4, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(5, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(6, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(7, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(8, T, T);
-    SOFTMAX_WARP_FORWARD_CASE(9, T, T);
+    SOFTMAX_WARP_FORWARD_CASE(0, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(1, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(2, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(3, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(4, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(5, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(6, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(7, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(8, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(9, T, AccT);
     default:
       break;
   }
 }
-
-template <>
-void SwitchWarpSoftmaxForward<paddle::platform::float16, false>(
-    const int blocks, const dim3 threads,
-    const framework::ExecutionContext& ctx, paddle::platform::float16* dst,
-    const paddle::platform::float16* src, const int batch_size,
-    const int stride, const int element_count, int Log2Elements) {
-#define T paddle::platform::float16
-#define isLog false
-  switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_CASE(0, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(1, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(2, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(3, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(4, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(5, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(6, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(7, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(8, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(9, paddle::platform::float16, float);
-    default:
-      break;
-  }
-#undef T
-#undef isLog
-}
-
-template <>
-void SwitchWarpSoftmaxForward<paddle::platform::float16, true>(
-    const int blocks, const dim3 threads,
-    const framework::ExecutionContext& ctx, paddle::platform::float16* dst,
-    const paddle::platform::float16* src, const int batch_size,
-    const int stride, const int element_count, int Log2Elements) {
-#define T paddle::platform::float16
-#define isLog true
-  switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_CASE(0, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(1, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(2, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(3, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(4, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(5, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(6, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(7, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(8, paddle::platform::float16, float);
-    SOFTMAX_WARP_FORWARD_CASE(9, paddle::platform::float16, float);
-    default:
-      break;
-  }
-#undef T
-#undef isLog
-}
-
-#undef SOFTMAX_WARP_FORWARD_CASE
 
 #define SOFTMAX_WARP_BACKWARD_CASE(Log2Elements, VecT, AccT)                \
   case Log2Elements:                                                        \
@@ -393,77 +318,25 @@ void SwitchWarpSoftmaxBackward(const int blocks, const dim3 threads,
                                const T* grad, const T* src,
                                const int batch_size, const int stride,
                                const int element_count, int Log2Elements) {
+  using AccT = typename details::MPTypeTrait<T>::Type;
   switch (Log2Elements) {
-    SOFTMAX_WARP_BACKWARD_CASE(0, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(1, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(2, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(3, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(4, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(5, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(6, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(7, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(8, T, T);
-    SOFTMAX_WARP_BACKWARD_CASE(9, T, T);
+    SOFTMAX_WARP_BACKWARD_CASE(0, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(1, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(2, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(3, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(4, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(5, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(6, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(7, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(8, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(9, T, AccT);
     default:
       break;
   }
 }
 
-template <>
-void SwitchWarpSoftmaxBackward<paddle::platform::float16, false>(
-    const int blocks, const dim3 threads,
-    const framework::ExecutionContext& ctx, paddle::platform::float16* dst,
-    const paddle::platform::float16* grad, const paddle::platform::float16* src,
-    const int batch_size, const int stride, const int element_count,
-    int Log2Elements) {
-#define T paddle::platform::float16
-#define isLog false
-  switch (Log2Elements) {
-    SOFTMAX_WARP_BACKWARD_CASE(0, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(1, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(2, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(3, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(4, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(5, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(6, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(7, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(8, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(9, paddle::platform::float16, float);
-    default:
-      break;
-  }
-#undef T
-#undef isLog
-}
-
-template <>
-void SwitchWarpSoftmaxBackward<paddle::platform::float16, true>(
-    const int blocks, const dim3 threads,
-    const framework::ExecutionContext& ctx, paddle::platform::float16* dst,
-    const paddle::platform::float16* grad, const paddle::platform::float16* src,
-    const int batch_size, const int stride, const int element_count,
-    int Log2Elements) {
-#define T paddle::platform::float16
-#define isLog true
-  switch (Log2Elements) {
-    SOFTMAX_WARP_BACKWARD_CASE(0, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(1, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(2, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(3, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(4, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(5, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(6, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(7, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(8, paddle::platform::float16, float);
-    SOFTMAX_WARP_BACKWARD_CASE(9, paddle::platform::float16, float);
-    default:
-      break;
-  }
-#undef T
-#undef isLog
-}
-
-#undef SwitchWarpSoftmaxBackward
+#undef SOFTMAX_WARP_FORWARD_CASE
+#undef SOFTMAX_WARP_BACKWARD_CASE
 
 template <typename T, bool isLog = false>
 class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
@@ -518,9 +391,17 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
 #ifdef PADDLE_WITH_HIP
       auto mode = axis == rank - 1 ? MIOPEN_SOFTMAX_MODE_INSTANCE
                                    : MIOPEN_SOFTMAX_MODE_CHANNEL;
-      PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxForward(
-          handle, platform::CudnnDataType<T>::kOne(), desc_, x->data<T>(),
-          platform::CudnnDataType<T>::kZero(), desc_, out_data));
+      if (isLog) {
+        PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxForward(
+            handle, MIOPEN_SOFTMAX_LOG, mode,
+            platform::CudnnDataType<T>::kOne(), desc_, x->data<T>(),
+            platform::CudnnDataType<T>::kZero(), desc_, out_data));
+      } else {
+        PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxForward(
+            handle, MIOPEN_SOFTMAX_ACCURATE, mode,
+            platform::CudnnDataType<T>::kOne(), desc_, x->data<T>(),
+            platform::CudnnDataType<T>::kZero(), desc_, out_data));
+      }
 #else
       auto mode = axis == rank - 1 ? CUDNN_SOFTMAX_MODE_INSTANCE
                                    : CUDNN_SOFTMAX_MODE_CHANNEL;
@@ -593,10 +474,19 @@ class SoftmaxGradCUDNNKernel : public framework::OpKernel<T> {
 #ifdef PADDLE_WITH_HIP
       auto mode = axis == rank - 1 ? MIOPEN_SOFTMAX_MODE_INSTANCE
                                    : MIOPEN_SOFTMAX_MODE_CHANNEL;
-      PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxBackward(
-          handle, platform::CudnnDataType<T>::kOne(), desc_, out->data<T>(),
-          desc_, dout->data<T>(), platform::CudnnDataType<T>::kZero(), desc_,
-          dx_data));
+      if (isLog) {
+        PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxBackward(
+            handle, MIOPEN_SOFTMAX_LOG, mode,
+            platform::CudnnDataType<T>::kOne(), desc_, out->data<T>(), desc_,
+            dout->data<T>(), platform::CudnnDataType<T>::kZero(), desc_,
+            dx_data));
+      } else {
+        PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxBackward(
+            handle, MIOPEN_SOFTMAX_ACCURATE, mode,
+            platform::CudnnDataType<T>::kOne(), desc_, out->data<T>(), desc_,
+            dout->data<T>(), platform::CudnnDataType<T>::kZero(), desc_,
+            dx_data));
+      }
 #else
       auto mode = axis == rank - 1 ? CUDNN_SOFTMAX_MODE_INSTANCE
                                    : CUDNN_SOFTMAX_MODE_CHANNEL;
@@ -639,14 +529,4 @@ REGISTER_OP_KERNEL(softmax_grad, CUDNN, plat::CUDAPlace,
                    ops::SoftmaxGradCUDNNKernel<float>,
                    ops::SoftmaxGradCUDNNKernel<double>,
                    ops::SoftmaxGradCUDNNKernel<plat::float16>);
-
-// REGISTER_OP_KERNEL(log_softmax, CUDNN, plat::CUDAPlace,
-//                    ops::SoftmaxCUDNNKernel<float, true>,
-//                    ops::SoftmaxCUDNNKernel<double, true>,
-//                    ops::SoftmaxCUDNNKernel<plat::float16, true>);
-// REGISTER_OP_KERNEL(log_softmax_grad, CUDNN, plat::CUDAPlace,
-//                    ops::SoftmaxGradCUDNNKernel<float, true>,
-//                    ops::SoftmaxGradCUDNNKernel<double, true>,
-//                    ops::SoftmaxGradCUDNNKernel<plat::float16, true>);
-
 #endif
