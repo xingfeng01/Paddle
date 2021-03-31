@@ -60,6 +60,26 @@ __global__ void Scale(T* logit_grad, const T* loss_grad, const int64_t num,
 }
 
 template <typename T>
+__global__ void SoftmaxWithCrossEntropyGradHardLabel(
+    T* logits_grad, const T* loss_grad, const int64_t* labels, const int64_t n,
+    const int64_t dim, const int64_t d, const int ignore_index) {
+  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t idx_n = idx / (d * dim);
+  int64_t idx_dim = (idx / d) % dim;
+  int64_t idx_d = idx % d;
+  int64_t ids = idx_n * d + idx_d;
+
+  if (labels[ids] == ignore_index) {
+    logits_grad[idx] = static_cast<T>(0.0);
+  } else if (labels[ids] == idx_dim) {
+    logits_grad[idx] =
+        (logits_grad[idx] - static_cast<T>(1.0)) * loss_grad[ids];
+  } else {
+    logits_grad[idx] *= loss_grad[ids];
+  }
+}
+
+template <typename T>
 __global__ void SoftCrossEntropyGradientKernel(T* logit_grad,
                                                const T* loss_grad,
                                                const T* labels, const int64_t n,
@@ -127,6 +147,8 @@ __global__ void ScaleCrossEntropyGradient(T* logit_grad, const T* loss_grad,
 
 }  // namespace
 
+/*
+
 static __device__ __forceinline__ platform::float16 exp_on_device(
     platform::float16 x) {
   return ::Eigen::numext::exp(x);
@@ -147,6 +169,7 @@ static __device__ __forceinline__ float log_on_device(float x) {
 static __device__ __forceinline__ double log_on_device(double x) {
   return math::TolerableValue<double>()(log(x));
 }
+*/
 
 /** In the following codes, 3 CUDA kernels are implemented to calculate softmax
  * and loss **/
@@ -181,9 +204,12 @@ Step 3 (RowReductionForSoftmaxAndCrossEntropy): calculate tmp_i_j = softmax'_i_j
 // BLOCK_REDUCE_RAKING_COMMUTATIVE_ONLY
 // BLOCK_REDUCE_RAKING
 // BLOCK_REDUCE_WARP_REDUCTIONS (default)
+
 template <typename T, int BlockDim>
 using BlockReduce =
     cub::BlockReduce<T, BlockDim /*, cub::BLOCK_REDUCE_WARP_REDUCTIONS*/>;
+
+/*
 
 template <typename T, int BlockDim>
 using BlockReduceTempStorage = typename BlockReduce<T, BlockDim>::TempStorage;
@@ -273,6 +299,8 @@ static __global__ void RowReductionForDiffMaxSum(const T* logits_data,
   if (threadIdx.x == 0) max_data[blockIdx.x] = 0;
 }
 
+*/
+
 #ifdef __HIPCC__  // @{ HIP Seperate Kernel for RowReductionForDiffMaxSum
 // Note(qili93): HIP do not support return in kernel, need to seperate
 // RowReductionForDiffMaxSum into two kernels below
@@ -326,6 +354,8 @@ static __global__ void RowReductionForDiff(const T* logits_data, T* max_data,
   if (threadIdx.x == 0) max_data[blockIdx.x] = 0;
 }
 #endif  // @} End HIP Seperate Kernel for RowReductionForDiffMaxSum
+
+/*
 
 // Make sure that BlockDim <= axis_dim
 template <typename T, int BlockDim>
@@ -432,6 +462,8 @@ struct HardLabelCrossEntropyFunctor {
   int axis_dim_;
 };
 
+*/
+/*
 template <typename T>
 struct HardLabelCrossEntropyFunctorWithIgnoreIdx {
  public:
@@ -467,7 +499,9 @@ struct HardLabelCrossEntropyFunctorWithIgnoreIdx {
   int axis_dim_;
   int ignore_idx_;
 };
+*/
 
+/*
 template <typename T>
 static void HardLabelCrossEntropy(const platform::CUDADeviceContext& ctx,
                                   const T* logits_data,
@@ -509,6 +543,9 @@ static void HardLabelCrossEntropy(const platform::CUDADeviceContext& ctx,
   }
 #undef CALL_HARD_LABEL_SOFTMAX_WITH_CROSS_ENTROPY_FUSED_KERNEL
 }
+*/
+
+/*
 
 template <typename T>
 struct HardLabelSoftmaxWithCrossEntropyFunctor {
@@ -595,6 +632,9 @@ struct HardLabelSoftmaxWithCrossEntropyFunctorWithIgnoreIdx {
   int ignore_idx_;
 };
 
+*/
+/*
+
 template <typename T>
 static void HardLabelSoftmaxWithCrossEntropy(
     const platform::CUDADeviceContext& ctx, const T* logits_data,
@@ -670,6 +710,10 @@ static void HardLabelSoftmaxWithCrossEntropy(
 #undef CALL_HARD_LABEL_SOFTMAX_WITH_CROSS_ENTROPY_FUSED_KERNEL
 }
 
+*/
+
+/*
+
 template <typename T>
 static void SoftmaxWithCrossEntropyFusedKernel(
     const T* logits_data, const T* labels_data, T* softmax_data, T* loss_data,
@@ -724,7 +768,9 @@ static void SoftmaxWithCrossEntropyFusedKernel(
 
 #undef CALL_SOFTMAX_WITH_CROSS_ENTROPY_FUSED_KERNEL
 }
+*/
 
+/*
 // not with softmax
 template <typename T>
 static void CrossEntropyFusedKernel(const T* logits_data, const T* labels_data,
@@ -761,6 +807,7 @@ static void CrossEntropyFusedKernel(const T* logits_data, const T* labels_data,
 
 #undef CALL_SOFTMAX_WITH_CROSS_ENTROPY_FUSED_KERNEL
 }
+*/
 
 template <typename T>
 class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
@@ -830,7 +877,7 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
             loss_data, logits_data, labels_data, n, dim, d, ignore_index);
       }
 
-      // input is softmax
+      // input is softmax, copy to output
       framework::TensorCopy(*logits, context.GetPlace(),
                             context.device_context(), softmax);
     } else {
@@ -919,26 +966,29 @@ class SoftmaxWithCrossEntropyGradCUDAKernel : public framework::OpKernel<T> {
             logit_grad_data, loss_grad_data, num, d, remain, label_data,
             ignore_index);
       }
-
-      return;
-    }
-
-    // with softmax, continue
-
-    if (context.Attr<bool>("soft_label")) {
-      int64_t grid = (n * d + block - 1) / block;
-      const T* label_data = labels->data<T>();
-      SoftCrossEntropyGradientKernel<T><<<grid, block, 0, stream>>>(
-          logit_grad_data, loss_grad_data, label_data, n, d, remain);
     } else {
-      int64_t grid = (n * remain + block - 1) / block;
-      const int64_t* label_data = labels->data<int64_t>();
-      CrossEntropyGrad<T><<<grid, block, 0, stream>>>(
-          logit_grad_data, label_data, n, d, remain, ignore_index);
-      int64_t num = n * d;
-      grid = (num + block - 1) / block;
-      Scale<T><<<grid, block, 0, stream>>>(logit_grad_data, loss_grad_data, num,
-                                           d, remain, label_data, ignore_index);
+      if (context.Attr<bool>("soft_label")) {
+        int64_t grid = (n * d + block - 1) / block;
+        const T* label_data = labels->data<T>();
+        SoftCrossEntropyGradientKernel<T><<<grid, block, 0, stream>>>(
+            logit_grad_data, loss_grad_data, label_data, n, d, remain);
+      } else {
+        int64_t grid = (n * remain + block - 1) / block;
+        const int64_t* label_data = labels->data<int64_t>();
+
+        // CrossEntropyGrad<T><<<grid, block, 0, stream>>>(
+        //     logit_grad_data, label_data, n, d, remain, ignore_index);
+
+        int64_t num = n * d;
+        grid = (num + block - 1) / block;
+        // Scale<T><<<grid, block, 0, stream>>>(logit_grad_data, loss_grad_data,
+        //                                      num, d, remain, label_data,
+        //                                      ignore_index);
+
+        SoftmaxWithCrossEntropyGradHardLabel<T><<<grid, block, 0, stream>>>(
+            logit_grad_data, loss_grad_data, label_data, n, d / remain, remain,
+            ignore_index);
+      }
     }
   }
 };
