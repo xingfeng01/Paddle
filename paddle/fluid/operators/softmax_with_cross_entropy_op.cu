@@ -69,13 +69,15 @@ __global__ void SoftmaxWithCrossEntropyGradHardLabel(
   int64_t idx_d = idx % d;
   int64_t ids = idx_n * d + idx_d;
 
-  if (labels[ids] == ignore_index) {
-    logits_grad[idx] = static_cast<T>(0.0);
-  } else if (labels[ids] == idx_dim) {
-    logits_grad[idx] =
-        (logits_grad[idx] - static_cast<T>(1.0)) * loss_grad[ids];
-  } else {
-    logits_grad[idx] *= loss_grad[ids];
+  if (idx < n * dim * d) {
+    if (labels[ids] == ignore_index) {
+      logits_grad[idx] = static_cast<T>(0.0);
+    } else if (labels[ids] == idx_dim) {
+      logits_grad[idx] =
+          (logits_grad[idx] - static_cast<T>(1.0)) * loss_grad[ids];
+    } else {
+      logits_grad[idx] *= loss_grad[ids];
+    }
   }
 }
 
