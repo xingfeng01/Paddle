@@ -38,7 +38,6 @@ using ScopedTensorDescriptor = platform::ScopedTensorDescriptor;
 using DataLayout = platform::DataLayout;
 using Tensor = framework::Tensor;
 
-
 template <typename T>
 __device__ __forceinline__ T logT(T x) {
   return std::log(x);
@@ -114,6 +113,7 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
 
   T sum[BATCH_SIZE]{(T)0.0};
   for (int i = 0; i < BATCH_SIZE; ++i) {
+    if (i >= local_batches) break;
     for (int it = 0; it < ITERATIONS; it++) {
       int ids = first_batch + i;
       int idx_n = ids / d;
@@ -140,9 +140,10 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
 
 template <typename T, typename VECT, typename ACCT, int Log2Elements>
 __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
-                                       const T* label, const int batch_size,
-                                       const int stride,
-                                       const int element_count) {
+                                            const T* label,
+                                            const int batch_size,
+                                            const int stride,
+                                            const int element_count) {
   const bool isLog = true;
 
   constexpr int dim_ceil = 1 << Log2Elements;
@@ -279,10 +280,11 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
 
 template <typename T, typename VECT, typename ACCT, int Log2Elements>
 __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
-                                       const int64_t* label,
-                                       const int batch_size, const int stride,
-                                       const int element_count,
-                                       const int ignore_index) {
+                                            const int64_t* label,
+                                            const int batch_size,
+                                            const int stride,
+                                            const int element_count,
+                                            const int ignore_index) {
   const bool isLog = true;
 
   constexpr int dim_ceil = 1 << Log2Elements;
@@ -410,20 +412,20 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
   };
 };
 
-#define SOFTMAX_WARP_FORWARD_SOFT_CASE(Log2Elements, VECT, ACCT)          \
-  case Log2Elements:                                                      \
+#define SOFTMAX_WARP_FORWARD_SOFT_CASE(Log2Elements, VECT, ACCT)               \
+  case Log2Elements:                                                           \
     WarpSoftmaxForwardSoftLabel<T, VECT, ACCT,                                 \
-                           Log2Elements><<<blocks, threads, 0, stream>>>( \
-        loss, softmax, src, label, batch_size, stride, element_count);    \
+                                Log2Elements><<<blocks, threads, 0, stream>>>( \
+        loss, softmax, src, label, batch_size, stride, element_count);         \
     break;
 
 template <typename T>
 void SwitchWarpSoftmaxForwardSoftLabel(const int blocks, const dim3 threads,
-                                  gpuStream_t stream, T* loss, T* softmax,
-                                  const T* src, const T* label,
-                                  const int batch_size, const int stride,
-                                  const int element_count,
-                                  const int Log2Elements) {
+                                       gpuStream_t stream, T* loss, T* softmax,
+                                       const T* src, const T* label,
+                                       const int batch_size, const int stride,
+                                       const int element_count,
+                                       const int Log2Elements) {
   switch (Log2Elements) {
     SOFTMAX_WARP_FORWARD_SOFT_CASE(0, T, T);
     SOFTMAX_WARP_FORWARD_SOFT_CASE(1, T, T);
@@ -467,21 +469,22 @@ void SwitchWarpSoftmaxForwardSoftLabel<paddle::platform::float16>(
 
 #undef SOFTMAX_WARP_FORWARD_SOFT_CASE
 
-#define SOFTMAX_WARP_FORWARD_HARD_CASE(Log2Elements, VECT, ACCT)          \
-  case Log2Elements:                                                      \
+#define SOFTMAX_WARP_FORWARD_HARD_CASE(Log2Elements, VECT, ACCT)               \
+  case Log2Elements:                                                           \
     WarpSoftmaxForwardHardLabel<T, VECT, ACCT,                                 \
-                           Log2Elements><<<blocks, threads, 0, stream>>>( \
-        loss, softmax, src, label, batch_size, stride, element_count,     \
-        ignore_index);                                                    \
+                                Log2Elements><<<blocks, threads, 0, stream>>>( \
+        loss, softmax, src, label, batch_size, stride, element_count,          \
+        ignore_index);                                                         \
     break;
 
 template <typename T>
 void SwitchWarpSoftmaxForwardHardLabel(const int blocks, const dim3 threads,
-                                  gpuStream_t stream, T* loss, T* softmax,
-                                  const T* src, const int64_t* label,
-                                  const int batch_size, const int stride,
-                                  const int element_count, int Log2Elements,
-                                  const int ignore_index) {
+                                       gpuStream_t stream, T* loss, T* softmax,
+                                       const T* src, const int64_t* label,
+                                       const int batch_size, const int stride,
+                                       const int element_count,
+                                       int Log2Elements,
+                                       const int ignore_index) {
   switch (Log2Elements) {
     SOFTMAX_WARP_FORWARD_HARD_CASE(0, T, T);
     SOFTMAX_WARP_FORWARD_HARD_CASE(1, T, T);
@@ -522,7 +525,6 @@ void SwitchWarpSoftmaxForwardHardLabel<paddle::platform::float16>(
   };
 #undef T
 };
-
 
 template <typename T>
 static void SoftmaxWithCrossEntropyHardLabel(
@@ -607,14 +609,12 @@ static void SoftmaxWithCrossEntropyHardLabel(
         platform::CudnnDataType<T>::kOne(), desc_, logits_data,
         platform::CudnnDataType<T>::kZero(), desc_, softmax_data));
 #endif
-
     int threads = 128;
     int blocks = (N * D + threads - 1) / threads;
     CrossEntropyHardLabel<T><<<blocks, threads>>>(
         loss_data, softmax_data, labels_data, N, dim, D, ignore_index);
   };
 };
-
 
 template <typename T>
 static void SoftmaxWithCrossEntropySoftLabel(
@@ -706,6 +706,5 @@ static void SoftmaxWithCrossEntropySoftLabel(
                                                   labels_data, N, dim, D);
   }
 }
-
 }
 }

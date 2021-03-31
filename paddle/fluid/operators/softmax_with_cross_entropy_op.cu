@@ -846,7 +846,6 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
       set_constant(context.cuda_device_context(), loss, static_cast<T>(0));
       return;
     }
-
     if (!softmax_switch) {  // input is softmax
       Tensor logits_2d, labels_2d, loss_2d, softmax_2d;
       logits_2d.ShareDataWith(*logits).Resize({n, d * dim});
