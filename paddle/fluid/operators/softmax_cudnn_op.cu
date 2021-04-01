@@ -358,8 +358,8 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
     constexpr int warps_per_block = 4;
 
     if (D == 1 && dim <= max_dim && sizeof(T) <= 4) {
-      const int dim_log2 = static_cast<int>(log2_ceil(dim));
-      const int kDimCeil = 1 << dim_log2;
+      const int kDimLog2 = static_cast<int>(log2_ceil(dim));
+      const int kDimCeil = 1 << kDimLog2;
       int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
       int batches_per_warp = (kDimCeil <= 128) ? 2 : 1;
 
@@ -372,7 +372,7 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
       dim3 threads(kWarpSize, warps_per_block, 1);
 
       SwitchWarpSoftmaxForward<T, isLog>(blocks, threads, ctx, out_data,
-                                         x->data<T>(), N, dim, dim, dim_log2);
+                                         x->data<T>(), N, dim, dim, kDimLog2);
 
     } else {
       ScopedTensorDescriptor desc;
@@ -442,8 +442,8 @@ class SoftmaxGradCUDNNKernel : public framework::OpKernel<T> {
     constexpr int warps_per_block = 4;
 
     if (D == 1 && dim <= max_dim && sizeof(T) <= 4) {
-      const int dim_log2 = log2_ceil(dim);
-      const int kDimCeil = 1 << dim_log2;
+      const int kDimLog2 = log2_ceil(dim);
+      const int kDimCeil = 1 << kDimLog2;
       int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
       int batches_per_warp = (kDimCeil <= 128) ? 2 : 1;
       constexpr int threads_per_block = 128;
@@ -455,7 +455,7 @@ class SoftmaxGradCUDNNKernel : public framework::OpKernel<T> {
 
       SwitchWarpSoftmaxBackward<T, isLog>(blocks, threads, ctx, dx_data,
                                           dout->data<T>(), out->data<T>(), N,
-                                          dim, dim, dim_log2);
+                                          dim, dim, kDimLog2);
 
     } else {
       ScopedTensorDescriptor desc;
