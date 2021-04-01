@@ -872,6 +872,10 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
             blocks, threads, context.cuda_device_context().stream(), loss_data,
             logits_data, labels_data, n, dim, d, kDimLog2);
 
+        //  CrossEntropySoftLabelGeneral<T><<<blocks, threads>>>(
+        //         loss_data,
+        //         logits_data, labels_data, n, dim, d);
+
       } else {  // HardLabel
         auto* logits_data = logits->data<T>();
         auto* labels_data = labels->data<int64_t>();
