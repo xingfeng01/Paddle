@@ -834,8 +834,8 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
     const int axis = CanonicalAxis(context.Attr<int>("axis"), rank);
     int dim = logits->dims()[axis];
 
-    const int64_t n = SizeToAxis(axis, logits->dims());
-    const int64_t d = SizeOutAxis(axis, logits->dims());
+    const int n = SizeToAxis(axis, logits->dims());
+    const int d = SizeOutAxis(axis, logits->dims());
 
     auto* softmax_data = softmax->mutable_data<T>(context.GetPlace());
     auto* loss_data = loss->mutable_data<T>(context.GetPlace());
@@ -857,6 +857,9 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
         auto* logits_data = logits->data<T>();
         auto* labels_data = labels->data<T>();
 
+        const int kDimLog2 = static_cast<int>(log2_ceil(dim));
+        const int kDimCeil = 1 << kDimLog2;
+
         int warp_size = 32;  // (dim < 32) ? dim : 32;
         int batches_per_warp = 1;
         constexpr int warps_per_block = 4;
@@ -865,8 +868,9 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
         int blocks = (n * d + batches_per_block - 1) / batches_per_block;
         dim3 threads(warp_size, warps_per_block, 1);
 
-        CrossEntropySoftLabel<T><<<blocks, threads>>>(loss_data, logits_data,
-                                                      labels_data, n, dim, d);
+        SwitchCrossEntropySoftLabel<T>(
+            blocks, threads, context.cuda_device_context().stream(), loss_data,
+            logits_data, labels_data, n, dim, d, kDimLog2);
 
       } else {  // HardLabel
         auto* logits_data = logits->data<T>();
