@@ -39,6 +39,42 @@ using ScopedTensorDescriptor = platform::ScopedTensorDescriptor;
 using DataLayout = platform::DataLayout;
 using Tensor = framework::Tensor;
 
+template <typename T>
+class VecT4 {};
+template <>
+class VecT4<double> {
+ public:
+  using Type = long4;
+};
+template <>
+class VecT4<float> {
+ public:
+  using Type = int4;
+};
+template <>
+class VecT4<platform::float16> {
+ public:
+  using Type = int2;
+};
+
+template <typename T>
+class VecT2 {};
+template <>
+class VecT2<double> {
+ public:
+  using Type = int4;
+};
+template <>
+class VecT2<float> {
+ public:
+  using Type = int2;
+};
+template <>
+class VecT2<platform::float16> {
+ public:
+  using Type = int;
+};
+
 int inline log2_ceil(int value) {
   int log2_value = 0;
   while ((1 << log2_value) < value) ++log2_value;
@@ -273,7 +309,7 @@ __global__ void WarpSoftmaxBackward(T* dst, const T* grad, const T* src,
   }
 }
 
-#define SOFTMAX_WARP_FORWARD_CASE(Log2Elements, VecT, AccT)                 \
+#define SOFTMAX_WARP_FORWARD_CASE(Log2Elements, AccT)                       \
   case Log2Elements:                                                        \
     WarpSoftmaxForward<                                                     \
         T, VecT, AccT, Log2Elements,                                        \
@@ -281,7 +317,7 @@ __global__ void WarpSoftmaxBackward(T* dst, const T* grad, const T* src,
         dst, src, batch_size, stride, element_count);                       \
     break;
 
-template <typename T, bool isLog>
+template <typename T, typename VecT, bool isLog>
 void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
                               const framework::ExecutionContext& ctx, T* dst,
                               const T* src, const int batch_size,
@@ -289,22 +325,22 @@ void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
                               int Log2Elements) {
   using AccT = typename details::MPTypeTrait<T>::Type;
   switch (Log2Elements) {
-    SOFTMAX_WARP_FORWARD_CASE(0, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(1, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(2, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(3, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(4, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(5, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(6, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(7, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(8, T, AccT);
-    SOFTMAX_WARP_FORWARD_CASE(9, T, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(0, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(1, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(2, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(3, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(4, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(5, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(6, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(7, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(8, AccT);
+    SOFTMAX_WARP_FORWARD_CASE(9, AccT);
     default:
       break;
   }
 }
 
-#define SOFTMAX_WARP_BACKWARD_CASE(Log2Elements, VecT, AccT)                \
+#define SOFTMAX_WARP_BACKWARD_CASE(Log2Elements, AccT)                      \
   case Log2Elements:                                                        \
     WarpSoftmaxBackward<                                                    \
         T, VecT, AccT, Log2Elements,                                        \
@@ -312,7 +348,7 @@ void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
         dst, grad, src, batch_size, stride, element_count);                 \
     break;
 
-template <typename T, bool isLog>
+template <typename T, typename VecT, bool isLog>
 void SwitchWarpSoftmaxBackward(const int blocks, const dim3 threads,
                                const framework::ExecutionContext& ctx, T* dst,
                                const T* grad, const T* src,
@@ -320,16 +356,16 @@ void SwitchWarpSoftmaxBackward(const int blocks, const dim3 threads,
                                const int element_count, int Log2Elements) {
   using AccT = typename details::MPTypeTrait<T>::Type;
   switch (Log2Elements) {
-    SOFTMAX_WARP_BACKWARD_CASE(0, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(1, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(2, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(3, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(4, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(5, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(6, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(7, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(8, T, AccT);
-    SOFTMAX_WARP_BACKWARD_CASE(9, T, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(0, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(1, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(2, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(3, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(4, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(5, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(6, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(7, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(8, AccT);
+    SOFTMAX_WARP_BACKWARD_CASE(9, AccT);
     default:
       break;
   }
@@ -371,9 +407,21 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
       int blocks = (N + batches_per_block - 1) / batches_per_block;
       dim3 threads(kWarpSize, warps_per_block, 1);
 
-      SwitchWarpSoftmaxForward<T, isLog>(blocks, threads, ctx, out_data,
-                                         x->data<T>(), N, dim, dim, kDimLog2);
-
+      using T4 = typename VecT4<T>::Type;
+      using T2 = typename VecT2<T>::Type;
+      if (dim % 4 == 0) {
+        SwitchWarpSoftmaxForward<T, T4, isLog>(blocks, threads, ctx, out_data,
+                                               x->data<T>(), N, dim, dim,
+                                               kDimLog2);
+      } else if (dim % 2 == 0) {
+        SwitchWarpSoftmaxForward<T, T2, isLog>(blocks, threads, ctx, out_data,
+                                               x->data<T>(), N, dim, dim,
+                                               kDimLog2);
+      } else {
+        SwitchWarpSoftmaxForward<T, T, isLog>(blocks, threads, ctx, out_data,
+                                              x->data<T>(), N, dim, dim,
+                                              kDimLog2);
+      }
     } else {
       ScopedTensorDescriptor desc;
       std::vector<int> tensor_dims = {N, dim, D, 1};
@@ -453,10 +501,21 @@ class SoftmaxGradCUDNNKernel : public framework::OpKernel<T> {
       int blocks = (N + batches_per_block - 1) / batches_per_block;
       dim3 threads(kWarpSize, warps_per_block, 1);
 
-      SwitchWarpSoftmaxBackward<T, isLog>(blocks, threads, ctx, dx_data,
-                                          dout->data<T>(), out->data<T>(), N,
-                                          dim, dim, kDimLog2);
-
+      using T4 = typename VecT4<T>::Type;
+      using T2 = typename VecT2<T>::Type;
+      if (dim % 4 == 0) {
+        SwitchWarpSoftmaxBackward<T, T4, isLog>(blocks, threads, ctx, dx_data,
+                                                dout->data<T>(), out->data<T>(),
+                                                N, dim, dim, kDimLog2);
+      } else if (dim % 2 == 0) {
+        SwitchWarpSoftmaxBackward<T, T2, isLog>(blocks, threads, ctx, dx_data,
+                                                dout->data<T>(), out->data<T>(),
+                                                N, dim, dim, kDimLog2);
+      } else {
+        SwitchWarpSoftmaxBackward<T, T, isLog>(blocks, threads, ctx, dx_data,
+                                               dout->data<T>(), out->data<T>(),
+                                               N, dim, dim, kDimLog2);
+      }
     } else {
       ScopedTensorDescriptor desc;
       std::vector<int> tensor_dims = {N, dim, D, 1};
