@@ -180,12 +180,12 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
   const int kBatchSize = 1;
   const int kThreadPerBatch = kThreadPerBlock / kBatchPerBlock;
   const int kWarpPerBatch = kThreadPerBatch / kWarpSize;
-  
+
   const int kIterations = (dim + kThreadPerBatch - 1) / kThreadPerBatch;
   const int kIterationsV = (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
 
   const int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
-  
+
   T sum[kBatchSize]{static_cast<T>(0.0)};
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
@@ -1134,18 +1134,8 @@ class SoftmaxWithCrossEntropyGradCUDAKernel : public framework::OpKernel<T> {
         SoftCrossEntropyGradientKernel<T><<<grid, block, 0, stream>>>(
             logit_grad_data, loss_grad_data, label_data, n, d, remain);
       } else {
-        int64_t grid = (n * remain + block - 1) / block;
         const int64_t* label_data = labels->data<int64_t>();
-
-        // CrossEntropyGrad<T><<<grid, block, 0, stream>>>(
-        //     logit_grad_data, label_data, n, d, remain, ignore_index);
-
-        int64_t num = n * d;
-        grid = (num + block - 1) / block;
-        // Scale<T><<<grid, block, 0, stream>>>(logit_grad_data, loss_grad_data,
-        //                                      num, d, remain, label_data,
-        //                                      ignore_index);
-
+        int grid = (n * d + block - 1) / block;
         SoftmaxWithCrossEntropyGradHardLabel<T><<<grid, block, 0, stream>>>(
             logit_grad_data, loss_grad_data, label_data, n, d / remain, remain,
             ignore_index);
