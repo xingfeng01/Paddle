@@ -39,6 +39,7 @@ using ScopedTensorDescriptor = platform::ScopedTensorDescriptor;
 using DataLayout = platform::DataLayout;
 using Tensor = framework::Tensor;
 
+// Vectorization trait 4 * sizeof(T)
 template <typename T>
 class VecT4 {};
 template <>
@@ -57,6 +58,7 @@ class VecT4<platform::float16> {
   using Type = int2;
 };
 
+// Vectorization trait 2 * sizeof(T)
 template <typename T>
 class VecT2 {};
 template <>
@@ -81,6 +83,16 @@ int inline log2_ceil(int value) {
   return log2_value;
 }
 
+/*
+Core function of computing softmax forward for axis=-1.
+The computation includes
+  - Compute maximum of batch: maxvalue_{i} = max_j src_{i,j}
+  - Compute sum of exp batch: s_{i} = sum_{j}{ exp(src_{i,j} - maxvalue_{i} }
+  - Compute: (a_{i,j} - maxvalue_{i}) / s_{i}
+One warp (32 threads) is used to compute 1 or 2 batch (kBatchSize).
+For reduction max (sum), firstly compute max (sum) to one warp, then use shuffle
+api to compute max (sum) in one warp.
+*/
 template <typename T, typename VecT, typename AccT, int Log2Elements,
           bool isLog = false>
 __global__ void WarpSoftmaxForward(T* softmax, const T* src,
@@ -203,6 +215,15 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   }
 }
 
+/*
+Core function of computing softmax backward for axis=-1.
+The computation includes
+  - Compute sum of exp batch: s_{i} = sum_{j} {src_{i,j} * grad_{i,j}
+  - Compute src_{i,j} * ( grad_{i,j}) - s_{i} )
+One warp (32 threads) is used to compute 1 or 2 batch (kBatchSize).
+For reduction max (sum), firstly compute max (sum) to one warp, then use shuffle
+api to compute max (sum) in one warp.
+*/
 template <typename T, typename VecT, typename AccT, int Log2Elements,
           bool isLog = false>
 __global__ void WarpSoftmaxBackward(T* dst, const T* grad, const T* src,
@@ -317,6 +338,9 @@ __global__ void WarpSoftmaxBackward(T* dst, const T* grad, const T* src,
         dst, src, batch_size, stride, element_count);                       \
     break;
 
+/*
+  Wrapper of softmax formward with template instantiation on size of input.
+*/
 template <typename T, typename VecT, bool isLog>
 void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
                               const framework::ExecutionContext& ctx, T* dst,
@@ -348,6 +372,9 @@ void SwitchWarpSoftmaxForward(const int blocks, const dim3 threads,
         dst, grad, src, batch_size, stride, element_count);                 \
     break;
 
+/*
+Wrapper of softmax backward with template instantiation on size of input.
+*/
 template <typename T, typename VecT, bool isLog>
 void SwitchWarpSoftmaxBackward(const int blocks, const dim3 threads,
                                const framework::ExecutionContext& ctx, T* dst,
@@ -407,6 +434,7 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
       int blocks = (N + batches_per_block - 1) / batches_per_block;
       dim3 threads(kWarpSize, warps_per_block, 1);
 
+      // vectorization read/write
       using T4 = typename VecT4<T>::Type;
       using T2 = typename VecT2<T>::Type;
       if (dim % 4 == 0) {
@@ -501,6 +529,7 @@ class SoftmaxGradCUDNNKernel : public framework::OpKernel<T> {
       int blocks = (N + batches_per_block - 1) / batches_per_block;
       dim3 threads(kWarpSize, warps_per_block, 1);
 
+      // vectorization read/write
       using T4 = typename VecT4<T>::Type;
       using T2 = typename VecT2<T>::Type;
       if (dim % 4 == 0) {
