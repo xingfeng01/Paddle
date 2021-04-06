@@ -141,9 +141,19 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   AccT max_value[kBatchSize];
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
-    max_value[i] = -std::numeric_limits<AccT>::infinity();
+
+    // it = 0
+    T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][0]);
+    T valmax = srcptr_v[0];
 #pragma unroll
-    for (int it = 0; it < kIterationsV; ++it) {
+    for (int s = 1; s < kVSize; ++s) {
+      valmax = (valmax > srcptr_v[s]) ? valmax : srcptr_v[s];
+    }
+    max_value[i] = static_cast<AccT>(valmax);
+
+    // it = 1, 2, ...
+#pragma unroll
+    for (int it = 1; it < kIterationsV; ++it) {
       T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
       T valmax = srcptr_v[0];
 #pragma unroll
@@ -210,6 +220,8 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
       int idx = threadIdx.x + it * kWarpSize;
       if (idx < idx_max_v) {
         softmax_v[idx] = tmpdata;
+      } else {
+        break;
       }
     }
   }
