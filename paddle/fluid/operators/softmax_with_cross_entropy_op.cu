@@ -34,6 +34,9 @@ using ScopedTensorDescriptor = platform::ScopedTensorDescriptor;
 using DataLayout = platform::DataLayout;
 using Tensor = framework::Tensor;
 
+/*
+  Compute max within one warp with shuffle api.
+*/
 template <typename T, int BatchSize, int WarpSize>
 __device__ __forceinline__ void WarpReduceSum(T* sum) {
 #pragma unroll
@@ -46,6 +49,9 @@ __device__ __forceinline__ void WarpReduceSum(T* sum) {
   }
 }
 
+/*
+  Compute sum within one warp with shuffle api.
+*/
 template <typename T, int BatchSize, int WarpSize>
 __device__ __forceinline__ void WarpReduceMax(T* sum) {
 #pragma unroll
@@ -64,12 +70,15 @@ __device__ __forceinline__ T logT(T x) {
   return static_cast<T>(std::log(static_cast<AccT>(x)));
 }
 
-int inline log2_ceil(int value) {
+static inline int log2_ceil(int value) {
   int log2_value = 0;
   while ((1 << log2_value) < value) ++log2_value;
   return log2_value;
 }
 
+/*
+  Hard label cross entropy.
+*/
 template <typename T>
 __global__ void CrossEntropyHardLabel(T* loss, const T* softmax,
                                       const int64_t* labels, const int n,
@@ -88,6 +97,9 @@ __global__ void CrossEntropyHardLabel(T* loss, const T* softmax,
   }
 }
 
+/*
+  Cross entropy soft label with templated size on axis.
+*/
 template <typename T, typename VecT, int Log2Elements>
 __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
                                       const T* labels, const int n,
@@ -107,19 +119,6 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
   }
 
   T sum[kBatchSize]{static_cast<T>(0.0)};
-// for (int i = 0; i < kBatchSize; ++i) {
-//   if (i >= local_batches) break;
-//   for (int it = 0; it < kIterations; it++) {
-//     int ids = first_batch + i;
-//     int idx_n = ids / d;
-//     int idx_d = ids % d;
-//     int idx_dim = it * kWarpSize + threadIdx.x;
-//     int idx = idx_n * dim * d + idx_d + idx_dim * d;
-//     if (idx_dim < dim) {
-//       sum[i] -= logT(softmax[idx]) * labels[idx];
-//     }
-//   }
-// }
 
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
@@ -134,11 +133,6 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
 
       const VecT* softmaxptr_v = reinterpret_cast<const VecT*>(&softmax[idx]);
       const VecT* labelsptr_v = reinterpret_cast<const VecT*>(&labels[idx]);
-
-      // max index to read
-      // int idx_max = (i < local_batches) ? dim : 0;
-      // int idx_max_v = idx_max / kVSize;
-      // int idx = threadIdx.x + it * kWarpSize;
 
       if (idx < idx_dim) {
         int idx = threadIdx.x + it * kWarpSize;
@@ -166,6 +160,9 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
   }
 }
 
+/*
+  Cross entropy soft label with dynamic size on axis (Log2Elements is varibale).
+*/
 template <typename T, typename VecT>
 __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
                                       const T* labels, const int n,
@@ -243,6 +240,9 @@ __global__ void CrossEntropySoftLabel(T* loss, const T* softmax,
         loss, softmax, labels, n, dim, d);                               \
     break;
 
+/*
+  Wrapper of cross entropy forward soft label.
+*/
 template <typename T>
 void SwitchCrossEntropySoftLabel(const int blocks, const dim3 threads,
                                  gpuStream_t stream, T* loss, const T* softmax,
@@ -266,6 +266,16 @@ void SwitchCrossEntropySoftLabel(const int blocks, const dim3 threads,
   }
 }
 
+/*
+Core function of softmax with cross entropy forward soft label.
+The computation includes
+  - Compute maximum of batch: maxvalue_{i} = max_j src_{i,j}
+  - Compute sum of exp batch: s_{i} = sum_{j}{ exp(src_{i,j} - maxvalue_{i} }
+  - Compute: sum of - sum_{j}{ label_{i,j} * (src_{i,j} - maxvalue_{i} - log(sum[i]))}
+One warp (32 threads) is used to compute 1 or 2 batch (kBatchSize).
+For reduction max (sum), firstly compute max (sum) to one warp, then use shuffle
+api to compute max (sum) in one warp.
+*/
 template <typename T, typename VecT, typename AccT, int Log2Elements>
 __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
                                             const T* label,
@@ -408,6 +418,10 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
   }
 }
 
+/*
+  Core function of softmax with cross entropy forward hard label.
+  Idea is similar 
+*/
 template <typename T, typename VecT, typename AccT, int Log2Elements>
 __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
                                             const int64_t* label,
@@ -553,6 +567,9 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
         loss, softmax, src, label, batch_size, stride, element_count);         \
     break;
 
+/*
+  Wrapper of softmax with cross entropy forward soft label.
+*/
 template <typename T>
 void SwitchWarpSoftmaxForwardSoftLabel(const int blocks, const dim3 threads,
                                        gpuStream_t stream, T* loss, T* softmax,
@@ -587,6 +604,9 @@ void SwitchWarpSoftmaxForwardSoftLabel(const int blocks, const dim3 threads,
         ignore_index);                                                         \
     break;
 
+/*
+  Wrapper of softmax with cross entropy forward hard label.
+*/
 template <typename T>
 void SwitchWarpSoftmaxForwardHardLabel(const int blocks, const dim3 threads,
                                        gpuStream_t stream, T* loss, T* softmax,
@@ -612,12 +632,19 @@ void SwitchWarpSoftmaxForwardHardLabel(const int blocks, const dim3 threads,
   }
 }
 
+/*
+  Wrapper of softmax with cross entropy backward hard label.
+*/
 template <typename T>
 static void SoftmaxWithCrossEntropyHardLabel(
     const framework::ExecutionContext& ctx, int rank, int axis,
     const T* logits_data, const int64_t* labels_data, T* loss_data,
     T* softmax_data, int N, int dim, int D, const int ignore_index) {
+#ifdef __HIPCC__
+  constexpr int kMaxBlockDim = 256;
+#else
   constexpr int kMaxBlockDim = 512;
+#endif
   int64_t block_dim = dim >= kMaxBlockDim
                           ? kMaxBlockDim
                           : (1 << static_cast<int>(std::log2(dim)));
@@ -707,7 +734,11 @@ static void SoftmaxWithCrossEntropySoftLabel(
     const framework::ExecutionContext& ctx, const int rank, const int axis,
     const T* logits_data, const T* labels_data, T* softmax_data, T* loss_data,
     int N, int dim, int D) {
+#ifdef __HIPCC__
+  constexpr int kMaxBlockDim = 256;
+#else
   constexpr int kMaxBlockDim = 512;
+#endif
   int64_t block_dim = dim >= kMaxBlockDim
                           ? kMaxBlockDim
                           : (1 << static_cast<int>(std::log2(dim)));
