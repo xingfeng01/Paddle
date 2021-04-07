@@ -113,7 +113,7 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   }
 
   // read data from global memory
-  VecT srcdata[kBatchSize][kIterationsV];
+  AccT srcdata[kBatchSize][kIterationsV][kVSize];
 
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
@@ -127,12 +127,15 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
     for (int it = 0; it < kIterationsV; ++it) {
       int src_idx = threadIdx.x + it * kWarpSize;
       if (src_idx < src_idx_max_v) {
-        srcdata[i][it] = src_v[src_idx];
+        VecT srctmp = src_v[src_idx];
+        const T* srcinptr = reinterpret_cast<const T*>(&srctmp);
+        for (int s = 0; s < kVSize; s++) {
+          srcdata[i][it][s] = static_cast<AccT>(srcinptr[s]);
+        }
       } else {
 #pragma unroll
         for (int s = 0; s < kVSize; s++) {
-          reinterpret_cast<T*>(&srcdata[i][it])[s] =
-              -std::numeric_limits<AccT>::infinity();
+          srcdata[i][it][s] = -std::numeric_limits<AccT>::infinity();
         }
       }
     }
@@ -143,26 +146,22 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
     // it = 0
-    T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][0]);
-    T valmax = srcptr_v[0];
+    AccT valmax = srcdata[i][0][0];
 #pragma unroll
     for (int s = 1; s < kVSize; ++s) {
-      valmax = (valmax > srcptr_v[s]) ? valmax : srcptr_v[s];
+      valmax = (valmax > srcdata[i][0][s]) ? valmax : srcdata[i][0][s];
     }
-    max_value[i] = static_cast<AccT>(valmax);
+    max_value[i] = valmax;
 
 // it = 1, 2, ...
 #pragma unroll
     for (int it = 1; it < kIterationsV; ++it) {
-      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
-      T valmax = srcptr_v[0];
+      AccT valmax = srcdata[i][it][0];
 #pragma unroll
       for (int s = 1; s < kVSize; ++s) {
-        valmax = (valmax > srcptr_v[s]) ? valmax : srcptr_v[s];
+        valmax = (valmax > srcdata[i][it][s]) ? valmax : srcdata[i][it][s];
       }
-      max_value[i] = (max_value[i] > static_cast<AccT>(valmax))
-                         ? max_value[i]
-                         : static_cast<AccT>(valmax);
+      max_value[i] = (max_value[i] > valmax) ? max_value[i] : valmax;
     }
   }
   WarpReduceMax<AccT, kBatchSize, kWarpSize>(max_value);
@@ -172,34 +171,32 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
     // it = 0
-    T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][0]);
     if (isLog) {
-      sum[i] = std::exp(static_cast<AccT>(srcptr_v[0]) - max_value[i]);
+      sum[i] = std::exp(srcdata[i][0][0] - max_value[i]);
     } else {
-      srcptr_v[0] = std::exp(static_cast<AccT>(srcptr_v[0]) - max_value[i]);
-      sum[i] = static_cast<AccT>(srcptr_v[0]);
+      srcdata[i][0][0] = std::exp(srcdata[i][0][0] - max_value[i]);
+      sum[i] = srcdata[i][0][0];
     }
 #pragma unroll
     for (int s = 1; s < kVSize; ++s) {
       if (isLog) {
-        sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+        sum[i] += std::exp(srcdata[i][0][s] - max_value[i]);
       } else {
-        srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
-        sum[i] += static_cast<AccT>(srcptr_v[s]);
+        srcdata[i][0][s] = std::exp(srcdata[i][0][s] - max_value[i]);
+        sum[i] += srcdata[i][0][s];
       }
     }
 
 // it = 1, 2, ...
 #pragma unroll
     for (int it = 1; it < kIterationsV; ++it) {
-      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
         if (isLog) {
-          sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+          sum[i] += std::exp(srcdata[i][it][s] - max_value[i]);
         } else {
-          srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
-          sum[i] += static_cast<AccT>(srcptr_v[s]);
+          srcdata[i][it][s] = std::exp(srcdata[i][it][s] - max_value[i]);
+          sum[i] += srcdata[i][it][s];
         }
       }
     }
@@ -224,15 +221,14 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
     }
 #pragma unroll
     for (int it = 0; it < kIterationsV; ++it) {
-      T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
       VecT tmpdata;
       T* tmpptr = reinterpret_cast<T*>(&tmpdata);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
         if (isLog) {
-          tmpptr[s] = static_cast<AccT>(srcptr_v[s]) - max_value[i] - sum[i];
+          tmpptr[s] = srcdata[i][it][s] - max_value[i] - sum[i];
         } else {
-          tmpptr[s] = static_cast<AccT>(srcptr_v[s]) / sum[i];
+          tmpptr[s] = srcdata[i][it][s] / sum[i];
         }
       }
 
