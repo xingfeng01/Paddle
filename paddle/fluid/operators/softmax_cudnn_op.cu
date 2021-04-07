@@ -77,7 +77,7 @@ class VecT2<platform::float16> {
   using Type = int;
 };
 
-int inline log2_ceil(int value) {
+int static inline log2_ceil(int value) {
   int log2_value = 0;
   while ((1 << log2_value) < value) ++log2_value;
   return log2_value;
@@ -104,7 +104,7 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   constexpr int kIterations = kDimCeil / kWarpSize;
   constexpr int kIterationsV =
       (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
-  constexpr int kBatchSize = (kDimCeil <= 128) ? 2 : 1;
+  constexpr int kBatchSize = (kDimCeil < 128) ? 2 : 1;
 
   int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
   int local_batches = batch_size - first_batch;
@@ -115,6 +115,7 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   // read data from global memory
   VecT srcdata[kBatchSize][kIterationsV];
 
+#pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
     const VecT* src_v =
         reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
@@ -141,7 +142,6 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   AccT max_value[kBatchSize];
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
-
     // it = 0
     T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][0]);
     T valmax = srcptr_v[0];
@@ -151,7 +151,7 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
     }
     max_value[i] = static_cast<AccT>(valmax);
 
-    // it = 1, 2, ...
+// it = 1, 2, ...
 #pragma unroll
     for (int it = 1; it < kIterationsV; ++it) {
       T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
@@ -168,11 +168,30 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   WarpReduceMax<AccT, kBatchSize, kWarpSize>(max_value);
 
   // compute sum
-  AccT sum[kBatchSize]{0.0};
+  AccT sum[kBatchSize];
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
+    // it = 0
+    T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][0]);
+    if (isLog) {
+      sum[i] = std::exp(static_cast<AccT>(srcptr_v[0]) - max_value[i]);
+    } else {
+      srcptr_v[0] = std::exp(static_cast<AccT>(srcptr_v[0]) - max_value[i]);
+      sum[i] = static_cast<AccT>(srcptr_v[0]);
+    }
 #pragma unroll
-    for (int it = 0; it < kIterationsV; ++it) {
+    for (int s = 1; s < kVSize; ++s) {
+      if (isLog) {
+        sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+      } else {
+        srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
+        sum[i] += static_cast<AccT>(srcptr_v[s]);
+      }
+    }
+
+// it = 1, 2, ...
+#pragma unroll
+    for (int it = 1; it < kIterationsV; ++it) {
       T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
