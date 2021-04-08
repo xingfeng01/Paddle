@@ -123,12 +123,14 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
     int src_idx_max = (i < local_batches) ? element_count : 0;
     int src_idx_max_v = src_idx_max / kVSize;
 
-    // read data
+// read data
+#pragma unroll
     for (int it = 0; it < kIterationsV; ++it) {
       int src_idx = threadIdx.x + it * kWarpSize;
       if (src_idx < src_idx_max_v) {
         VecT srctmp = src_v[src_idx];
         const T* srcinptr = reinterpret_cast<const T*>(&srctmp);
+#pragma unroll
         for (int s = 0; s < kVSize; s++) {
           srcdata[i][it][s] = static_cast<AccT>(srcinptr[s]);
         }
@@ -203,12 +205,9 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   }
   WarpReduceSum<AccT, kBatchSize, kWarpSize>(sum);
 
-  // write result to global memory
-  VecT* softmax_v = reinterpret_cast<VecT*>(softmax);
+// write result to global memory
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
-    if (i >= local_batches) break;
-
     VecT* softmax_v =
         reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
 
