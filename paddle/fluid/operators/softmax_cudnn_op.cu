@@ -107,9 +107,17 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   constexpr int kBatchSize = (kDimCeil < 128) ? 2 : 1;
 
   int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
-  int local_batches = batch_size - first_batch;
-  if (local_batches > kBatchSize) {
-    local_batches = kBatchSize;
+
+  // max index to read
+  int idx_max_v[kBatchSize];
+#pragma unroll
+  for (int i = 0; i < kBatchSize; i++) {
+    int src_idx_max = ((i + first_batch) < batch_size) ? element_count : 0;
+    if (kVSize == 1) {
+      idx_max_v[i] = src_idx_max;
+    } else {
+      idx_max_v[i] = src_idx_max / kVSize;
+    }
   }
 
   // read data from global memory
@@ -119,15 +127,12 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   for (int i = 0; i < kBatchSize; ++i) {
     const VecT* src_v =
         reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
-    // max index to read
-    int src_idx_max = (i < local_batches) ? element_count : 0;
-    int src_idx_max_v = src_idx_max / kVSize;
 
 // read data
 #pragma unroll
     for (int it = 0; it < kIterationsV; ++it) {
       int src_idx = threadIdx.x + it * kWarpSize;
-      if (src_idx < src_idx_max_v) {
+      if (src_idx < idx_max_v[i]) {
         VecT srctmp = src_v[src_idx];
         const T* srcinptr = reinterpret_cast<const T*>(&srctmp);
 #pragma unroll
@@ -211,10 +216,6 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
     VecT* softmax_v =
         reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
 
-    // max index to write
-    int idx_max = (i < local_batches) ? element_count : 0;
-    int idx_max_v = idx_max / kVSize;
-
     if (isLog) {
       sum[i] = std::log(sum[i]);
     }
@@ -232,7 +233,7 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
       }
 
       int idx = threadIdx.x + it * kWarpSize;
-      if (idx < idx_max_v) {
+      if (idx < idx_max_v[i]) {
         softmax_v[idx] = tmpdata;
       } else {
         break;
