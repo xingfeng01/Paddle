@@ -104,7 +104,7 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   constexpr int kIterations = kDimCeil / kWarpSize;
   constexpr int kIterationsV =
       (kIterations >= kVSize) ? (kIterations / kVSize) : 1;
-  constexpr int kBatchSize = (kDimCeil < 128) ? 2 : 1;
+  constexpr int kBatchSize = (kDimCeil <= 32) ? 2 : 1;
 
   int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchSize;
 
@@ -112,11 +112,11 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
   int idx_max_v[kBatchSize];
 #pragma unroll
   for (int i = 0; i < kBatchSize; i++) {
-    int src_idx_max = ((i + first_batch) < batch_size) ? element_count : 0;
+    int idx_max = ((i + first_batch) < batch_size) ? element_count : 0;
     if (kVSize == 1) {
-      idx_max_v[i] = src_idx_max;
+      idx_max_v[i] = idx_max;
     } else {
-      idx_max_v[i] = src_idx_max / kVSize;
+      idx_max_v[i] = idx_max / kVSize;
     }
   }
 
