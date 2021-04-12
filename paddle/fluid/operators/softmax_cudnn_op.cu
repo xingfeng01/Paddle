@@ -446,7 +446,7 @@ class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
       const int kDimLog2 = static_cast<int>(log2_ceil(dim));
       const int kDimCeil = 1 << kDimLog2;
       int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
-      int batches_per_warp = (kDimCeil <= 128) ? 2 : 1;
+      int batches_per_warp = (kDimCeil <= 32) ? 2 : 1;
 
       // use 128 threads per block to maximimize gpu utilization
       constexpr int threads_per_block = 128;
