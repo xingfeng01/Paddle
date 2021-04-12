@@ -683,6 +683,7 @@ static void SoftmaxWithCrossEntropyHardLabel(
     PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxForward(
         handle, platform::CudnnDataType<T>::kOne(), desc_, logits_data,
         platform::CudnnDataType<T>::kZero(), desc_, softmax_data));
+
 #else
     auto mode = axis == rank - 1 ? CUDNN_SOFTMAX_MODE_INSTANCE
                                  : CUDNN_SOFTMAX_MODE_CHANNEL;
@@ -751,8 +752,7 @@ static void SoftmaxWithCrossEntropySoftLabel(
     auto mode = axis == rank - 1 ? MIOPEN_SOFTMAX_MODE_INSTANCE
                                  : MIOPEN_SOFTMAX_MODE_CHANNEL;
     PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::miopenSoftmaxForward(
-        handle, CUDNN_SOFTMAX_ACCURATE, mode,
-        platform::CudnnDataType<T>::kOne(), desc_, logits_data,
+        handle, platform::CudnnDataType<T>::kOne(), desc_, logits_data,
         platform::CudnnDataType<T>::kZero(), desc_, softmax_data));
 #else
     auto mode = axis == rank - 1 ? CUDNN_SOFTMAX_MODE_INSTANCE
