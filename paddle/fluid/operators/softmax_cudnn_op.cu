@@ -120,24 +120,32 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
 
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
-    const VecT* src_v =
-        reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
-
 // read data
 #pragma unroll
     for (int it = 0; it < kIterationsV; ++it) {
       int src_idx = threadIdx.x + it * kWarpSize;
-      if (src_idx < idx_max_v[i]) {
-        VecT srctmp = src_v[src_idx];
-        const T* srcinptr = reinterpret_cast<const T*>(&srctmp);
-#pragma unroll
-        for (int s = 0; s < kVSize; s++) {
-          srcdata[i][it][s] = static_cast<AccT>(srcinptr[s]);
+      if (kVSize == 1) {
+        if (src_idx < idx_max_v[i]) {
+          srcdata[i][it][0] =
+              static_cast<AccT>(src[(first_batch + i) * stride + src_idx]);
+        } else {
+          srcdata[i][it][0] = -std::numeric_limits<AccT>::infinity();
         }
       } else {
+        const VecT* src_v =
+            reinterpret_cast<const VecT*>(&src[(first_batch + i) * stride]);
+        if (src_idx < idx_max_v[i]) {
+          VecT srctmp = src_v[src_idx];
+          const T* srcinptr = reinterpret_cast<const T*>(&srctmp);
 #pragma unroll
-        for (int s = 0; s < kVSize; s++) {
-          srcdata[i][it][s] = -std::numeric_limits<AccT>::infinity();
+          for (int s = 0; s < kVSize; s++) {
+            srcdata[i][it][s] = static_cast<AccT>(srcinptr[s]);
+          }
+        } else {
+#pragma unroll
+          for (int s = 0; s < kVSize; s++) {
+            srcdata[i][it][s] = -std::numeric_limits<AccT>::infinity();
+          }
         }
       }
     }
