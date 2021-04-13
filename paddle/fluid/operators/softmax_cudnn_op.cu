@@ -216,30 +216,44 @@ __global__ void WarpSoftmaxForward(T* softmax, const T* src,
 // write result to global memory
 #pragma unroll
   for (int i = 0; i < kBatchSize; ++i) {
-    VecT* softmax_v =
-        reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
-
     if (LogMode) {
       sum[i] = std::log(sum[i]);
     }
+
 #pragma unroll
     for (int it = 0; it < kIterationsV; ++it) {
-      VecT tmpdata;
-      T* tmpptr = reinterpret_cast<T*>(&tmpdata);
-#pragma unroll
-      for (int s = 0; s < kVSize; ++s) {
-        if (LogMode) {
-          tmpptr[s] = srcdata[i][it][s] - max_value[i] - sum[i];
-        } else {
-          tmpptr[s] = srcdata[i][it][s] / sum[i];
-        }
-      }
-
       int idx = threadIdx.x + it * kWarpSize;
-      if (idx < idx_max_v[i]) {
-        softmax_v[idx] = tmpdata;
+      if (kVSize == 1) {
+        if (idx < idx_max_v[i]) {
+          if (LogMode) {
+            softmax[(first_batch + i) * stride + idx] =
+                srcdata[i][it][0] - max_value[i] - sum[i];
+          } else {
+            softmax[(first_batch + i) * stride + idx] =
+                srcdata[i][it][0] / sum[i];
+          }
+        } else {
+          break;
+        }
       } else {
-        break;
+        VecT* softmax_v =
+            reinterpret_cast<VecT*>(&softmax[(first_batch + i) * stride]);
+        VecT tmpdata;
+        T* tmpptr = reinterpret_cast<T*>(&tmpdata);
+#pragma unroll
+        for (int s = 0; s < kVSize; ++s) {
+          if (LogMode) {
+            tmpptr[s] = srcdata[i][it][s] - max_value[i] - sum[i];
+          } else {
+            tmpptr[s] = srcdata[i][it][s] / sum[i];
+          }
+        }
+
+        if (idx < idx_max_v[i]) {
+          softmax_v[idx] = tmpdata;
+        } else {
+          break;
+        }
       }
     }
   }
