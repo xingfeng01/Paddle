@@ -275,7 +275,7 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
                                             const int batch_size,
                                             const int stride,
                                             const int element_count) {
-  const bool isLog = true;
+  const bool LogMode = true;
 
   constexpr int kDimCeil = 1 << Log2Elements;
   constexpr int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
@@ -351,7 +351,7 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
       T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
-        if (isLog) {
+        if (LogMode) {
           sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
         } else {
           srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
@@ -375,7 +375,7 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
     int idx_max = (i < local_batches) ? element_count : 0;
     int idx_max_v = idx_max / kVSize;
 
-    if (isLog) {
+    if (LogMode) {
       sum[i] = std::log(sum[i]);
     }
 #pragma unroll
@@ -386,7 +386,7 @@ __global__ void WarpSoftmaxForwardSoftLabel(T* loss, T* softmax, const T* src,
       T* tmpvp = reinterpret_cast<T*>(&tmpv);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
-        if (isLog) {
+        if (LogMode) {
           AccT logsoftmax = static_cast<AccT>(srcvp[s]) - max_value[i] - sum[i];
           sumloss[i] -= logsoftmax * static_cast<AccT>(labelvp[s]);
           tmpvp[s] = std::exp(logsoftmax);
@@ -422,7 +422,7 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
                                             const int stride,
                                             const int element_count,
                                             const int ignore_index) {
-  const bool isLog = true;
+  const bool LogMode = true;
 
   constexpr int kDimCeil = 1 << Log2Elements;
   constexpr int kWarpSize = (kDimCeil < 32) ? kDimCeil : 32;
@@ -494,7 +494,7 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
       T* srcptr_v = reinterpret_cast<T*>(&srcdata[i][it]);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
-        if (isLog) {
+        if (LogMode) {
           sum[i] += std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
         } else {
           srcptr_v[s] = std::exp(static_cast<AccT>(srcptr_v[s]) - max_value[i]);
@@ -518,7 +518,7 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
     int idx_max = (i < local_batches) ? element_count : 0;
     int idx_max_v = idx_max / kVSize;
 
-    if (isLog) {
+    if (LogMode) {
       sum[i] = std::log(sum[i]);
     }
 #pragma unroll
@@ -528,7 +528,7 @@ __global__ void WarpSoftmaxForwardHardLabel(T* loss, T* softmax, const T* src,
       T* tmpvp = reinterpret_cast<T*>(&tmpv);
 #pragma unroll
       for (int s = 0; s < kVSize; ++s) {
-        if (isLog) {
+        if (LogMode) {
           AccT logsoftmax = static_cast<AccT>(srcvp[s]) - max_value[i] - sum[i];
           tmpvp[s] = std::exp(logsoftmax);
 
@@ -924,7 +924,8 @@ class SoftmaxWithCrossEntropyCUDAKernel : public framework::OpKernel<T> {
 
         int threads = 128;
         int blocks = (n * d + threads - 1) / threads;
-        CrossEntropyHardLabel<T><<<blocks, threads>>>(
+        CrossEntropyHardLabel<
+            T><<<blocks, threads, 0, context.cuda_device_context().stream()>>>(
             loss_data, logits_data, labels_data, n, dim, d, ignore_index);
       }
 
