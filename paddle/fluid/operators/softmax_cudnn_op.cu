@@ -449,6 +449,9 @@ template <typename T, bool LogMode = false>
 class SoftmaxCUDNNKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext& ctx) const override {
+    
+    printf("\n Softmax Compute \n");
+    
     auto* x = ctx.Input<Tensor>("X");
     auto* out = ctx.Output<Tensor>("Out");
     out->mutable_data<T>(ctx.GetPlace());

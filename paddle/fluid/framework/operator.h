@@ -245,7 +245,11 @@ class ExecutionContext {
   ExecutionContext(const OperatorBase& op, const Scope& scope,
                    const platform::DeviceContext& device_context,
                    const RuntimeContext& ctx)
-      : op_(op), scope_(scope), device_context_(device_context), ctx_(ctx) {}
+      : op_(op), scope_(scope), device_context_(device_context), ctx_(ctx) {
+
+
+        printf("\nExecutionContext Constructor operator.h\n");
+      }
   virtual ~ExecutionContext() {}
 
   virtual std::string InputName(const std::string& name) const {

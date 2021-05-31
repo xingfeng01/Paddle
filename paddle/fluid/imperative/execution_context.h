@@ -39,7 +39,11 @@ class DygraphExecutionContext : public framework::ExecutionContext {
       : ExecutionContext(op, scope, device_context, ctx),
         var_base_map_in_(var_base_map_in),
         var_base_map_out_(var_base_map_out),
-        attrs_(attrs) {}
+        attrs_(attrs) {
+
+
+          printf("\nDygraphExecutionContext Constructor execution_context.h\n");
+        }
 
   std::string InputName(const std::string& name) const override {
     auto it = var_base_map_in_.find(name);

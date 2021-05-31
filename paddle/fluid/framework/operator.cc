@@ -605,7 +605,10 @@ bool OpSupportGPU(const std::string& op_type) {
 class RuntimeInferShapeContext : public InferShapeContext {
  public:
   RuntimeInferShapeContext(const OperatorBase& op, const RuntimeContext& ctx)
-      : op_(op), ctx_(ctx) {}
+      : op_(op), ctx_(ctx) {
+
+        printf("\nRuntimeInferShapeContext Constructor operator.cc\n");
+      }
 
   bool HasInput(const std::string& name) const override {
     // has only one input
@@ -1141,10 +1144,16 @@ void OperatorWithKernel::RunImpl(const Scope& scope,
   // TODO(panyx0718): ExecutionContext should only depend on RuntimeContext
   // not Scope. Imperative mode only pass inputs and get outputs.
   {
+
+    printf("\n ExecutionContext RunImpl 0000 \n");
+
     platform::RecordEvent record_event("compute",
                                        platform::EventRole::kInnerOp);
     (*kernel_func_)(
         ExecutionContext(*this, exec_scope, *dev_ctx, *runtime_ctx));
+
+    printf("\n ExecutionContext RunImpl 1111 \n");
+
   }
 
   if (!transfered_inplace_vars.empty()) {

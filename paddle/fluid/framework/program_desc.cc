@@ -49,6 +49,11 @@ void ProgramDesc::SetVersion(const int64_t version) {
 }
 
 ProgramDesc::ProgramDesc() {
+
+  printf("\n ProgramDesc::ProgramDesc() \n");
+  std::cout << this << std::endl;
+
+
   SetVersion(kCurProgramVersion);
   auto *block = desc_.mutable_blocks()->Add();
   block->set_idx(kRootBlockIndex);
@@ -57,6 +62,9 @@ ProgramDesc::ProgramDesc() {
 }
 
 ProgramDesc::ProgramDesc(const ProgramDesc &o) {
+
+  printf("\n ProgramDesc::ProgramDesc(const) \n");
+
   desc_ = o.desc_;
   for (int i = 0; i < desc_.blocks_size(); ++i) {
     auto *block = desc_.mutable_blocks(i);
@@ -87,6 +95,10 @@ ProgramDesc::ProgramDesc(const ProgramDesc &o) {
 }
 
 ProgramDesc::ProgramDesc(const proto::ProgramDesc &desc) {
+
+
+  printf("\n ProgramDesc::ProgramDesc(const proto) \n");
+
   desc_ = desc;
   InitFromProto();
 }

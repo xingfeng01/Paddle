@@ -788,7 +788,13 @@ void OpDesc::InferShape(const BlockDesc &block) const {
       sout << "]";
       VLOG(10) << sout.str();
     }
+
+    printf("\n infer_shape(&ctx) 0000 \n");
+
     infer_shape(&ctx);
+
+    printf("\n infer_shape(&ctx) 1111 \n");
+
   } catch (platform::EnforceNotMet &exception) {
     framework::AppendErrorOpHint(Type(), &exception);
     throw std::move(exception);
@@ -812,7 +818,11 @@ void OpDesc::InferVarType(BlockDesc *block) const {
 
 CompileTimeInferShapeContext::CompileTimeInferShapeContext(
     const OpDesc &op, const BlockDesc &block)
-    : op_(op), block_(block) {}
+    : op_(op), block_(block) {
+
+      printf("\nCompileTimeInferShapeContext Constructor op_desc.cc\n");
+
+    }
 
 bool CompileTimeInferShapeContext::HasInput(const std::string &name) const {
   if (op_.Inputs().find(name) == op_.Inputs().end()) {

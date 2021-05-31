@@ -38,6 +38,9 @@ class SoftmaxOp : public framework::OperatorWithKernel {
   using framework::OperatorWithKernel::OperatorWithKernel;
 
   void InferShape(framework::InferShapeContext* ctx) const override {
+
+    std::cout << std::endl << " Softmax infershape " << std::endl;
+
     PADDLE_ENFORCE_EQ(
         ctx->HasInput("X"), true,
         platform::errors::NotFound("Input(X) of SoftmaxOp is not found."));
